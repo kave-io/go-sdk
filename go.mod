@@ -1,12 +1,10 @@
-module github.com/kave-io/kave/sdk/go
+module github.com/kave-io/go-sdk
 
 go 1.26.1
 
-replace github.com/kave-io/kave/proto/gen => ../../core/proto/gen
-
 require (
 	connectrpc.com/connect v1.19.1
-	github.com/kave-io/kave/proto/gen v0.0.0
+	github.com/kave-io/kave/proto/gen v0.1.0
 	go.opentelemetry.io/otel v1.41.0
 	go.opentelemetry.io/otel/trace v1.41.0
 	google.golang.org/grpc v1.80.0

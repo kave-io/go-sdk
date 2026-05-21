@@ -2,8 +2,8 @@
 
 ## 0.1.0
 
-- Module renamed to `github.com/kave-io/kave/sdk/go` (monorepo; no separate repo).
-- `replace` directive dropped; `go.work` workspace used instead.
+- Module path finalized as `github.com/kave-io/go-sdk` for the standalone Go SDK repository.
+- `replace` directive dropped; `github.com/kave-io/kave/proto/gen` is pinned to v0.1.0.
 - Default server address changed from `:8080` to `:18080`.
 - `errors.go`: added `IsAlreadyExists`, `IsPermissionDenied`, `IsUnauthenticated`,
   `IsInvalidArgument`, `IsUnavailable`, `IsCanceled`, `IsDeadlineExceeded`.

@@ -6,8 +6,8 @@ import (
 	"log"
 
 	"connectrpc.com/connect"
+	kave "github.com/kave-io/go-sdk"
 	controlv1 "github.com/kave-io/kave/proto/gen/kave/control/v1"
-	kave "github.com/kave-io/kave/sdk/go"
 )
 
 func main() {

@@ -5,8 +5,8 @@ import (
 	"log"
 	"os"
 
+	kave "github.com/kave-io/go-sdk"
 	runtimev1 "github.com/kave-io/kave/proto/gen/kave/runtime/v1"
-	kave "github.com/kave-io/kave/sdk/go"
 )
 
 func main() {

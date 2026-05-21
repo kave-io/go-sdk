@@ -2,7 +2,7 @@ name: release-go-sdk
 
 on:
   push:
-    tags: ["sdk/go/v*"]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -37,7 +37,7 @@ jobs:
             core/proto/gen/go.sum
 
       - name: Enforce changelog entry
-        run: core/scripts/check-sdk-changelog.sh go "${GITHUB_REF_NAME#sdk/go/}"
+        run: core/scripts/check-sdk-changelog.sh go "${GITHUB_REF_NAME}"
 
       - name: Test Go SDK
         working-directory: sdk/go
@@ -81,7 +81,7 @@ jobs:
           set -euo pipefail
           tmp="$(mktemp -d)"
           GOMODCACHE="$tmp/mod" GOCACHE="$tmp/build" \
-            go install "github.com/kave-io/kave/sdk/go/examples/bootstrap@${GITHUB_REF_NAME}"
+            go install "github.com/kave-io/go-sdk/examples/bootstrap@${GITHUB_REF_NAME}"
 
       - name: Stop contract server
         if: always()

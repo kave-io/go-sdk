@@ -6,9 +6,9 @@ import (
 	"log"
 	"os"
 
+	kave "github.com/kave-io/go-sdk"
 	commonv1 "github.com/kave-io/kave/proto/gen/kave/common/v1"
 	controlv1 "github.com/kave-io/kave/proto/gen/kave/control/v1"
-	kave "github.com/kave-io/kave/sdk/go"
 )
 
 func main() {

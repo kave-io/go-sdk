@@ -5,11 +5,12 @@ Go SDK for the Kave control, runtime, and audit APIs.
 ## Install
 
 ```bash
-go get github.com/kave-io/kave/sdk/go@v0.1.0
+go get github.com/kave-io/go-sdk@v0.1.0
 ```
 
-For local monorepo development this module uses a narrow `replace` for
-`github.com/kave-io/kave/proto/gen`; do not rely on a repo-root `go.work`.
+For local monorepo development, use an uncommitted `go.work` that includes this
+module and `../../core/proto/gen`. Release builds must not use local `replace`
+directives.
 
 ## Quickstart
 
