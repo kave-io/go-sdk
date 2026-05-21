@@ -14,6 +14,7 @@ import (
 // Client is the Kave SDK entry point. Use New to construct one.
 type Client struct {
 	Control controlv1connect.ControlPlaneServiceClient
+	RBAC    controlv1connect.RBACServiceClient
 	Runtime runtimev1connect.RuntimeServiceClient
 	Audit   auditv1connect.AuditServiceClient
 }
@@ -27,29 +28,42 @@ func New(opts ...Option) *Client {
 	}
 
 	var httpClient connect.HTTPClient = o.httpClient
-	if o.token != "" {
-		httpClient = &tokenClient{inner: o.httpClient, token: o.token}
+	if o.token != "" || o.userAgent != "" {
+		httpClient = &headerClient{inner: o.httpClient, token: o.token, userAgent: o.userAgent}
 	}
 
+	interceptors := []connect.Interceptor{
+		retryInterceptor(o.retryPolicy),
+		observabilityInterceptor(o.logger, o.tracer),
+		errorInterceptor(),
+	}
 	connectOpts := append([]connect.ClientOption{
 		connect.WithCompressMinBytes(1024),
+		connect.WithInterceptors(interceptors...),
 	}, o.connectOpts...)
 
 	return &Client{
 		Control: controlv1connect.NewControlPlaneServiceClient(httpClient, o.baseURL, connectOpts...),
+		RBAC:    controlv1connect.NewRBACServiceClient(httpClient, o.baseURL, connectOpts...),
 		Runtime: runtimev1connect.NewRuntimeServiceClient(httpClient, o.baseURL, connectOpts...),
 		Audit:   auditv1connect.NewAuditServiceClient(httpClient, o.baseURL, connectOpts...),
 	}
 }
 
-// tokenClient injects an Authorization header on every request.
-type tokenClient struct {
-	inner connect.HTTPClient
-	token string
+// headerClient injects process-wide SDK headers on every request.
+type headerClient struct {
+	inner     connect.HTTPClient
+	token     string
+	userAgent string
 }
 
-func (t *tokenClient) Do(req *http.Request) (*http.Response, error) {
+func (h *headerClient) Do(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
-	req.Header.Set("Authorization", "Bearer "+t.token)
-	return t.inner.Do(req)
+	if h.token != "" {
+		req.Header.Set("Authorization", "Bearer "+h.token)
+	}
+	if h.userAgent != "" {
+		req.Header.Set("User-Agent", h.userAgent)
+	}
+	return h.inner.Do(req)
 }

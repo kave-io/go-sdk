@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"log"
 
-	kave "github.com/kave-io/go-sdk"
-	controlv1 "github.com/kave-io/kave/proto/gen/kave/control/v1"
 	"connectrpc.com/connect"
+	controlv1 "github.com/kave-io/kave/proto/gen/kave/control/v1"
+	kave "github.com/kave-io/kave/sdk/go"
 )
 
 func main() {
 	client := kave.New(
-		kave.WithAddr("http://localhost:8080"),
+		kave.WithAddr("http://localhost:18080"),
 		kave.WithToken("your-kave-token"),
 	)
 
