@@ -37,7 +37,8 @@ jobs:
             core/proto/gen/go.sum
 
       - name: Enforce changelog entry
-        run: core/scripts/check-sdk-changelog.sh go "${GITHUB_REF_NAME}"
+        working-directory: core
+        run: scripts/check-sdk-changelog.sh go "${GITHUB_REF_NAME}"
 
       - name: Test Go SDK
         working-directory: sdk/go
