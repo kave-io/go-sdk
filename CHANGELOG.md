@@ -1,6 +1,6 @@
 # Go SDK Changelog
 
-## Unreleased (0.1.0-contract)
+## 0.1.0
 
 - Module renamed to `github.com/kave-io/kave/sdk/go` (monorepo; no separate repo).
 - `replace` directive dropped; `go.work` workspace used instead.
