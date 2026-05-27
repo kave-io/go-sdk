@@ -1,4 +1,4 @@
-module github.com/kave-io/go-sdk
+module github.com/kave-io/kave/sdk/go
 
 go 1.26.1
 

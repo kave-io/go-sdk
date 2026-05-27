@@ -5,7 +5,7 @@ Go SDK for the Kave control, runtime, and audit APIs.
 ## Install
 
 ```bash
-go get github.com/kave-io/go-sdk@v0.1.0
+go get github.com/kave-io/kave/sdk/go@v0.2.0
 ```
 
 For local monorepo development, use an uncommitted `go.work` that includes this
@@ -15,11 +15,72 @@ directives.
 ## Quickstart
 
 ```go
-client := kave.New(
-	kave.WithAddr("http://localhost:18080"),
-	kave.WithToken(os.Getenv("KAVE_TOKEN")),
+client, err := kave.NewFromConfig(kave.ClientConfig{
+	Addr:  "http://localhost:18080",
+	Token: os.Getenv("KAVE_TOKEN"),
+})
+if err != nil {
+	return err
+}
+
+result, err := client.Bootstrap(ctx, kave.BootstrapSpec{
+	Organization: kave.OrganizationSpec{Name: "Acme", Slug: "acme"},
+	Project:      kave.ProjectSpec{Name: "acme-ai", Slug: "acme-ai"},
+	Environments: []kave.EnvironmentSpec{kave.Development()},
+	Policies: []kave.PolicySpec{
+		kave.EnforcePolicy("development", "default-ai-policy"),
+	},
+	Agents: []kave.AgentSpec{
+		kave.Agent("development", "clinic-assistant",
+			kave.WithAgentPolicy("default-ai-policy"),
+		),
+	},
+	Budgets: []kave.BudgetSpec{
+		kave.MonthlyBudget("clinic-assistant", kave.AmountUSD("50")),
+	},
+})
+if err != nil {
+	return err
+}
+_ = result.Agents["clinic-assistant"].GetId()
+```
+
+The quickstart uses SDK-native specs, so application setup code does not need
+to import generated proto request packages. The generated clients are still
+available for advanced calls.
+
+## Startup provisioning
+
+Use `Bootstrap` for startup setup:
+
+- organization and project
+- environments
+- policies
+- agents
+- per-agent budgets
+- optional agent tokens
+- optional RBAC roles and bindings
+
+`Bootstrap` resolves environment, policy, and agent references by name within
+the same spec. RBAC bindings can reference roles by name. Ensure-style
+resources are idempotent; tokens are intentionally created only when listed
+because raw token secrets are returned once.
+
+For one-off calls, use the matching spec helpers:
+
+```go
+agent, err := client.EnsureAgentSpec(ctx,
+	kave.Agent("env_123", "clinic-assistant",
+		kave.WithAgentDescription("Handles clinic AI workflows"),
+	),
 )
-org, err := client.EnsureOrganization(ctx, &controlv1.CreateOrganizationRequest{Name: "Acme", Slug: "acme"})
+```
+
+RBAC can use the same style:
+
+```go
+role, err := client.EnsureRoleSpec(ctx, kave.Role("ai-admin", "agents:read", "agents:write"))
+binding, err := client.EnsureRBACBindingSpec(ctx, kave.Binding(role.GetId(), "user:123", "project:abc:*"))
 ```
 
 ## Auth

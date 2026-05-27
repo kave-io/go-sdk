@@ -5,8 +5,7 @@ import (
 	"log"
 	"os"
 
-	kave "github.com/kave-io/go-sdk"
-	runtimev1 "github.com/kave-io/kave/proto/gen/kave/runtime/v1"
+	kave "github.com/kave-io/kave/sdk/go"
 )
 
 func main() {
@@ -21,11 +20,11 @@ func main() {
 		log.Fatal("KAVE_ENV_ID is required")
 	}
 
-	for run, err := range client.WatchRuns(ctx, &runtimev1.WatchRunsRequest{EnvId: envID}) {
+	for run, err := range client.WatchRuns(ctx, kave.RunWatch{EnvID: envID}) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		log.Printf("run id=%s status=%s", run.GetId(), run.GetStatus())
+		log.Printf("run id=%s status=%s", run.ID, run.Status)
 	}
 }
 

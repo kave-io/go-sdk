@@ -23,11 +23,46 @@ const (
 	CodeUnavailable      Code = "Unavailable"
 )
 
+// Sentinel errors for use with errors.Is. They carry only a Code, so
+// errors.Is(err, ErrNotFound) matches any SDK error with CodeNotFound.
+var (
+	ErrCanceled         = &Error{Code: CodeCanceled}
+	ErrInvalidArgument  = &Error{Code: CodeInvalidArgument}
+	ErrDeadlineExceeded = &Error{Code: CodeDeadlineExceeded}
+	ErrNotFound         = &Error{Code: CodeNotFound}
+	ErrAlreadyExists    = &Error{Code: CodeAlreadyExists}
+	ErrPermissionDenied = &Error{Code: CodePermissionDenied}
+	ErrUnauthenticated  = &Error{Code: CodeUnauthenticated}
+	ErrUnavailable      = &Error{Code: CodeUnavailable}
+)
+
 // Error is returned by SDK calls instead of transport-specific status types.
 type Error struct {
 	Code    Code
 	Message string
 	cause   error
+}
+
+// Is reports whether target is a sentinel error (a bare Code) matching this
+// error's Code, enabling errors.Is(err, ErrNotFound) and similar.
+func (e *Error) Is(target error) bool {
+	t, ok := target.(*Error)
+	if !ok {
+		return false
+	}
+	if t.Message == "" && t.cause == nil {
+		return e != nil && e.Code == t.Code
+	}
+	return e == t
+}
+
+// CodeOf returns the transport-neutral code for any error produced by the SDK,
+// the empty Code for a nil error, or CodeUnknown if it cannot be classified.
+func CodeOf(err error) Code {
+	if err == nil {
+		return ""
+	}
+	return codeOf(err)
 }
 
 func (e *Error) Error() string {
@@ -45,6 +80,10 @@ func (e *Error) Unwrap() error {
 		return nil
 	}
 	return e.cause
+}
+
+func invalidArgument(message string) error {
+	return &Error{Code: CodeInvalidArgument, Message: message}
 }
 
 func wrapError(err error) error {

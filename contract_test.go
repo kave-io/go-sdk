@@ -9,9 +9,7 @@ import (
 	"testing"
 	"time"
 
-	kave "github.com/kave-io/go-sdk"
-	controlv1 "github.com/kave-io/kave/proto/gen/kave/control/v1"
-	runtimev1 "github.com/kave-io/kave/proto/gen/kave/runtime/v1"
+	kave "github.com/kave-io/kave/sdk/go"
 )
 
 func newContractClient(t *testing.T) *kave.Client {
@@ -39,21 +37,21 @@ func TestContractEnsureOrganization(t *testing.T) {
 	c := newContractClient(t)
 
 	slug := uniqueName("ct-org")
-	req := &controlv1.CreateOrganizationRequest{Name: slug, Slug: slug}
+	in := kave.OrganizationInput{Name: slug, Slug: slug}
 
-	org1, err := c.EnsureOrganization(ctx, req)
+	org1, err := c.EnsureOrganization(ctx, in)
 	if err != nil {
 		t.Fatalf("first EnsureOrganization: %v", err)
 	}
-	if org1.GetSlug() != slug {
-		t.Fatalf("slug mismatch: got %q, want %q", org1.GetSlug(), slug)
+	if org1.Slug != slug {
+		t.Fatalf("slug mismatch: got %q, want %q", org1.Slug, slug)
 	}
 
-	org2, err := c.EnsureOrganization(ctx, req)
+	org2, err := c.EnsureOrganization(ctx, in)
 	if err != nil {
 		t.Fatalf("second EnsureOrganization: %v", err)
 	}
-	if org2.GetId() != org1.GetId() {
+	if org2.ID != org1.ID {
 		t.Fatal("EnsureOrganization not idempotent: second call returned a different org")
 	}
 }
@@ -64,25 +62,23 @@ func TestContractEnsureProject(t *testing.T) {
 	c := newContractClient(t)
 
 	orgSlug := uniqueName("ct-proj-org")
-	org, err := c.EnsureOrganization(ctx, &controlv1.CreateOrganizationRequest{
-		Name: orgSlug, Slug: orgSlug,
-	})
+	org, err := c.EnsureOrganization(ctx, kave.OrganizationInput{Name: orgSlug, Slug: orgSlug})
 	if err != nil {
 		t.Fatalf("setup EnsureOrganization: %v", err)
 	}
 
 	slug := uniqueName("ct-proj")
-	req := &controlv1.CreateProjectRequest{OrgId: org.GetId(), Name: slug, Slug: slug}
+	in := kave.ProjectInput{OrgID: org.ID, Name: slug, Slug: slug}
 
-	p1, err := c.EnsureProject(ctx, req)
+	p1, err := c.EnsureProject(ctx, in)
 	if err != nil {
 		t.Fatalf("first EnsureProject: %v", err)
 	}
-	p2, err := c.EnsureProject(ctx, req)
+	p2, err := c.EnsureProject(ctx, in)
 	if err != nil {
 		t.Fatalf("second EnsureProject: %v", err)
 	}
-	if p2.GetId() != p1.GetId() {
+	if p2.ID != p1.ID {
 		t.Fatal("EnsureProject not idempotent")
 	}
 }
@@ -92,29 +88,14 @@ func TestContractEnsureEnvironment(t *testing.T) {
 	ctx := context.Background()
 	c := newContractClient(t)
 
-	orgSlug := uniqueName("ct-env-org")
-	org, err := c.EnsureOrganization(ctx, &controlv1.CreateOrganizationRequest{Name: orgSlug, Slug: orgSlug})
-	if err != nil {
-		t.Fatalf("setup org: %v", err)
-	}
-	projSlug := uniqueName("ct-env-proj")
-	proj, err := c.EnsureProject(ctx, &controlv1.CreateProjectRequest{OrgId: org.GetId(), Name: projSlug, Slug: projSlug})
-	if err != nil {
-		t.Fatalf("setup project: %v", err)
-	}
+	env := setupEnv(t, ctx, c, "ct-env")
+	in := kave.EnvironmentInput{ProjectID: env.ProjectID, Name: env.Name, Slug: env.Slug}
 
-	slug := uniqueName("ct-env")
-	req := &controlv1.CreateEnvironmentRequest{ProjectId: proj.GetId(), Name: slug, Slug: slug}
-
-	e1, err := c.EnsureEnvironment(ctx, req)
+	e2, err := c.EnsureEnvironment(ctx, in)
 	if err != nil {
-		t.Fatalf("first EnsureEnvironment: %v", err)
+		t.Fatalf("re-EnsureEnvironment: %v", err)
 	}
-	e2, err := c.EnsureEnvironment(ctx, req)
-	if err != nil {
-		t.Fatalf("second EnsureEnvironment: %v", err)
-	}
-	if e2.GetId() != e1.GetId() {
+	if e2.ID != env.ID {
 		t.Fatal("EnsureEnvironment not idempotent")
 	}
 }
@@ -127,17 +108,17 @@ func TestContractEnsureAgent(t *testing.T) {
 	env := setupEnv(t, ctx, c, "ct-agent")
 
 	name := uniqueName("bot")
-	req := &controlv1.CreateAgentRequest{EnvId: env.GetId(), Name: name}
+	in := kave.AgentInput{EnvID: env.ID, Name: name}
 
-	a1, err := c.EnsureAgent(ctx, req)
+	a1, err := c.EnsureAgent(ctx, in)
 	if err != nil {
 		t.Fatalf("first EnsureAgent: %v", err)
 	}
-	a2, err := c.EnsureAgent(ctx, req)
+	a2, err := c.EnsureAgent(ctx, in)
 	if err != nil {
 		t.Fatalf("second EnsureAgent: %v", err)
 	}
-	if a2.GetId() != a1.GetId() {
+	if a2.ID != a1.ID {
 		t.Fatal("EnsureAgent not idempotent")
 	}
 }
@@ -150,17 +131,17 @@ func TestContractEnsurePolicy(t *testing.T) {
 	env := setupEnv(t, ctx, c, "ct-policy")
 
 	name := uniqueName("pol")
-	req := &controlv1.CreatePolicyRequest{EnvId: env.GetId(), Name: name}
+	in := kave.PolicyInput{EnvID: env.ID, Name: name}
 
-	p1, err := c.EnsurePolicy(ctx, req)
+	p1, err := c.EnsurePolicy(ctx, in)
 	if err != nil {
 		t.Fatalf("first EnsurePolicy: %v", err)
 	}
-	p2, err := c.EnsurePolicy(ctx, req)
+	p2, err := c.EnsurePolicy(ctx, in)
 	if err != nil {
 		t.Fatalf("second EnsurePolicy: %v", err)
 	}
-	if p2.GetId() != p1.GetId() {
+	if p2.ID != p1.ID {
 		t.Fatal("EnsurePolicy not idempotent")
 	}
 }
@@ -171,21 +152,16 @@ func TestContractCreateAgentToken(t *testing.T) {
 	c := newContractClient(t)
 
 	env := setupEnv(t, ctx, c, "ct-token")
-	agent, err := c.EnsureAgent(ctx, &controlv1.CreateAgentRequest{
-		EnvId: env.GetId(), Name: uniqueName("bot"),
-	})
+	agent, err := c.EnsureAgent(ctx, kave.AgentInput{EnvID: env.ID, Name: uniqueName("bot")})
 	if err != nil {
 		t.Fatalf("setup agent: %v", err)
 	}
 
-	resp, err := c.CreateAgentToken(ctx, &controlv1.CreateTokenRequest{
-		AgentId: agent.GetId(),
-		Name:    "test-token",
-	})
+	issued, err := c.CreateAgentToken(ctx, kave.TokenInput{AgentID: agent.ID, Name: "test-token"})
 	if err != nil {
 		t.Fatalf("CreateAgentToken: %v", err)
 	}
-	if resp.GetRawToken() == "" {
+	if issued.RawToken == "" {
 		t.Fatal("CreateAgentToken: empty raw token")
 	}
 }
@@ -196,34 +172,26 @@ func TestContractRunLifecycle(t *testing.T) {
 	c := newContractClient(t)
 
 	env := setupEnv(t, ctx, c, "ct-run")
-	agent, err := c.EnsureAgent(ctx, &controlv1.CreateAgentRequest{
-		EnvId: env.GetId(), Name: uniqueName("runner"),
-	})
+	agent, err := c.EnsureAgent(ctx, kave.AgentInput{EnvID: env.ID, Name: uniqueName("runner")})
 	if err != nil {
 		t.Fatalf("setup agent: %v", err)
 	}
 
-	run, err := c.CreateRun(ctx, &runtimev1.CreateRunRequest{
-		AgentId: agent.GetId(),
-		EnvId:   env.GetId(),
-	})
+	run, err := c.CreateRun(ctx, kave.RunInput{AgentID: agent.ID, EnvID: env.ID, ProjectID: env.ProjectID})
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
-	if run.GetId() == "" {
+	if run.ID == "" {
 		t.Fatal("CreateRun: empty id")
 	}
 
-	completedStatus := runtimev1.RunStatus_RUN_STATUS_COMPLETED
-	updated, err := c.UpdateRun(ctx, &runtimev1.UpdateRunRequest{
-		Id:     run.GetId(),
-		Update: &runtimev1.RunUpdate{Status: &completedStatus},
-	})
+	completed := kave.RunStatusCompleted
+	updated, err := c.UpdateRun(ctx, kave.RunUpdateInput{ID: run.ID, Status: &completed})
 	if err != nil {
 		t.Fatalf("UpdateRun: %v", err)
 	}
-	if updated.GetStatus() != runtimev1.RunStatus_RUN_STATUS_COMPLETED {
-		t.Fatalf("UpdateRun: expected COMPLETED, got %v", updated.GetStatus())
+	if updated.Status != kave.RunStatusCompleted {
+		t.Fatalf("UpdateRun: expected completed, got %v", updated.Status)
 	}
 }
 
@@ -233,24 +201,17 @@ func TestContractSpanLifecycle(t *testing.T) {
 	c := newContractClient(t)
 
 	env := setupEnv(t, ctx, c, "ct-span")
-	agent, err := c.EnsureAgent(ctx, &controlv1.CreateAgentRequest{
-		EnvId: env.GetId(), Name: uniqueName("spanner"),
-	})
+	agent, err := c.EnsureAgent(ctx, kave.AgentInput{EnvID: env.ID, Name: uniqueName("spanner")})
 	if err != nil {
 		t.Fatalf("setup agent: %v", err)
 	}
-	run, err := c.CreateRun(ctx, &runtimev1.CreateRunRequest{
-		AgentId: agent.GetId(),
-		EnvId:   env.GetId(),
-	})
+	run, err := c.CreateRun(ctx, kave.RunInput{AgentID: agent.ID, EnvID: env.ID, ProjectID: env.ProjectID})
 	if err != nil {
 		t.Fatalf("setup run: %v", err)
 	}
 
-	err = c.WithSpan(ctx, &runtimev1.OpenSpanRequest{
-		Span: &runtimev1.SpanInput{RunId: run.GetId(), Name: "test-span"},
-	}, func(ctx context.Context, span *runtimev1.SpanRow) error {
-		if span.GetId() == "" {
+	err = c.WithSpan(ctx, kave.SpanInput{RunID: run.ID, Name: "test-span"}, func(ctx context.Context, span *kave.Span) error {
+		if span.ID == "" {
 			return fmt.Errorf("span id is empty")
 		}
 		return nil
@@ -260,21 +221,21 @@ func TestContractSpanLifecycle(t *testing.T) {
 	}
 }
 
-// setupEnv is a test helper that creates a fresh org → project → env chain.
-func setupEnv(t *testing.T, ctx context.Context, c *kave.Client, prefix string) *controlv1.Environment {
+// setupEnv is a test helper that creates a fresh org -> project -> env chain.
+func setupEnv(t *testing.T, ctx context.Context, c *kave.Client, prefix string) *kave.Environment {
 	t.Helper()
 	orgSlug := uniqueName(prefix + "-org")
-	org, err := c.EnsureOrganization(ctx, &controlv1.CreateOrganizationRequest{Name: orgSlug, Slug: orgSlug})
+	org, err := c.EnsureOrganization(ctx, kave.OrganizationInput{Name: orgSlug, Slug: orgSlug})
 	if err != nil {
 		t.Fatalf("setup org: %v", err)
 	}
 	projSlug := uniqueName(prefix + "-proj")
-	proj, err := c.EnsureProject(ctx, &controlv1.CreateProjectRequest{OrgId: org.GetId(), Name: projSlug, Slug: projSlug})
+	proj, err := c.EnsureProject(ctx, kave.ProjectInput{OrgID: org.ID, Name: projSlug, Slug: projSlug})
 	if err != nil {
 		t.Fatalf("setup project: %v", err)
 	}
 	envSlug := uniqueName(prefix + "-env")
-	env, err := c.EnsureEnvironment(ctx, &controlv1.CreateEnvironmentRequest{ProjectId: proj.GetId(), Name: envSlug, Slug: envSlug})
+	env, err := c.EnsureEnvironment(ctx, kave.EnvironmentInput{ProjectID: proj.ID, Name: envSlug, Slug: envSlug})
 	if err != nil {
 		t.Fatalf("setup env: %v", err)
 	}

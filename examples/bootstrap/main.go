@@ -6,70 +6,56 @@ import (
 	"log"
 	"os"
 
-	kave "github.com/kave-io/go-sdk"
-	commonv1 "github.com/kave-io/kave/proto/gen/kave/common/v1"
-	controlv1 "github.com/kave-io/kave/proto/gen/kave/control/v1"
+	kave "github.com/kave-io/kave/sdk/go"
 )
 
 func main() {
 	ctx := context.Background()
-	client := kave.New(
-		kave.WithAddr(env("KAVE_ADDR", "http://localhost:18080")),
-		kave.WithToken(os.Getenv("KAVE_TOKEN")),
-	)
-
-	org, err := client.EnsureOrganization(ctx, &controlv1.CreateOrganizationRequest{
-		Name: "Simorq",
-		Slug: "simorq",
+	client, err := kave.NewFromConfig(kave.ClientConfig{
+		Addr:  env("KAVE_ADDR", "http://localhost:18080"),
+		Token: os.Getenv("KAVE_TOKEN"),
 	})
-	must("ensure org", err)
+	must("create client", err)
 
-	project, err := client.EnsureProject(ctx, &controlv1.CreateProjectRequest{
-		OrgId: org.GetId(),
-		Name:  "simorq",
-		Slug:  "simorq",
+	budget := kave.MonthlyBudget("clinic-assistant", kave.AmountUSD("50"))
+	softCap := kave.AmountUSD("40")
+	budget.SoftCap = &softCap
+
+	result, err := client.Bootstrap(ctx, kave.BootstrapInput{
+		Organization: kave.OrganizationInput{Name: "Simorq", Slug: "simorq"},
+		Project:      kave.ProjectInput{Name: "simorq", Slug: "simorq"},
+		Environments: []kave.EnvironmentInput{kave.Development()},
+		Policies: []kave.PolicyInput{
+			{
+				Env:         "development",
+				Name:        "simorq-default",
+				Description: "Default PHI-safe policy for Simorq development",
+				Mode:        kave.PolicyModeEnforce,
+			},
+		},
+		Agents: []kave.AgentInput{
+			{
+				Env:         "development",
+				Name:        "clinic-assistant",
+				Description: "Default Simorq clinic assistant",
+				Policy:      "simorq-default",
+			},
+		},
+		Budgets: []kave.BudgetInput{budget},
+		Tokens: []kave.TokenInput{
+			{Agent: "clinic-assistant", Name: "simorq-dev-bootstrap"},
+		},
 	})
-	must("ensure project", err)
+	must("bootstrap", err)
 
-	envRecord, err := client.EnsureEnvironment(ctx, &controlv1.CreateEnvironmentRequest{
-		ProjectId: project.GetId(),
-		Name:      "development",
-		Slug:      "development",
-		Type:      controlv1.EnvironmentType_ENVIRONMENT_TYPE_DEV,
-	})
-	must("ensure environment", err)
-
-	agent, err := client.EnsureAgent(ctx, &controlv1.CreateAgentRequest{
-		EnvId:       envRecord.GetId(),
-		Name:        "clinic-assistant",
-		Description: "Default Simorq clinic assistant",
-	})
-	must("ensure agent", err)
-
-	_, err = client.EnsurePolicy(ctx, &controlv1.CreatePolicyRequest{
-		EnvId:       envRecord.GetId(),
-		Name:        "simorq-default",
-		Description: "Default PHI-safe policy for Simorq development",
-		Mode:        controlv1.PolicyMode_POLICY_MODE_ENFORCE,
-	})
-	must("ensure policy", err)
-
-	_, err = client.EnsureBudget(ctx, &controlv1.CreateBudgetRequest{
-		AgentId: agent.GetId(),
-		HardCap: &commonv1.Amount{Currency: "USD", Decimal: "50"},
-		SoftCap: &commonv1.Amount{Currency: "USD", Decimal: "40"},
-		Period:  controlv1.BudgetPeriod_BUDGET_PERIOD_MONTHLY,
-	})
-	must("ensure budget", err)
-
-	token, err := client.CreateAgentToken(ctx, &controlv1.CreateTokenRequest{
-		AgentId: agent.GetId(),
-		Name:    "simorq-dev-bootstrap",
-	})
-	must("create token", err)
-
+	agent := result.Agents["clinic-assistant"]
+	token := result.Tokens["simorq-dev-bootstrap"]
 	fmt.Printf("org=%s project=%s env=%s agent=%s token=%s\n",
-		org.GetId(), project.GetId(), envRecord.GetId(), agent.GetId(), token.GetRawToken())
+		result.Organization.ID,
+		result.Project.ID,
+		result.Environments["development"].ID,
+		agent.ID,
+		token.RawToken)
 }
 
 func env(key, fallback string) string {

@@ -69,7 +69,7 @@ func TestIterateAgentsPagesUntilNextCursorIsEmpty(t *testing.T) {
 		if err != nil {
 			t.Fatalf("IterateAgents yielded error: %v", err)
 		}
-		ids = append(ids, agent.GetId())
+		ids = append(ids, agent.ID)
 	}
 	if len(ids) != 3 {
 		t.Fatalf("ids = %v, want three paged agents", ids)

@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"connectrpc.com/connect"
-	kave "github.com/kave-io/go-sdk"
-	controlv1 "github.com/kave-io/kave/proto/gen/kave/control/v1"
+	kave "github.com/kave-io/kave/sdk/go"
 )
 
 func main() {
@@ -18,34 +16,35 @@ func main() {
 
 	ctx := context.Background()
 
-	// Create an organization
-	org, err := client.Control.CreateOrganization(ctx, connect.NewRequest(&controlv1.CreateOrganizationRequest{
+	// Ensure an organization (idempotent).
+	org, err := client.EnsureOrganization(ctx, kave.OrganizationInput{
 		Name: "acme",
 		Slug: "acme",
-	}))
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("org:", org.Msg.Id)
+	fmt.Println("org:", org.ID)
 
-	// Create a project
-	proj, err := client.Control.CreateProject(ctx, connect.NewRequest(&controlv1.CreateProjectRequest{
-		OrgId: org.Msg.Id,
+	// Ensure a project within it.
+	proj, err := client.EnsureProject(ctx, kave.ProjectInput{
+		OrgID: org.ID,
 		Name:  "my-agent",
 		Slug:  "my-agent",
-	}))
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("project:", proj.Msg.Id)
+	fmt.Println("project:", proj.ID)
 
-	// List agents
-	agents, err := client.Control.ListAgents(ctx, connect.NewRequest(&controlv1.ListAgentsRequest{
-		EnvId: "env-id",
-		Limit: 10,
-	}))
-	if err != nil {
-		log.Fatal(err)
+	// List agents in an environment.
+	count := 0
+	for agent, err := range client.IterateAgents(ctx, "env-id") {
+		if err != nil {
+			log.Fatal(err)
+		}
+		_ = agent
+		count++
 	}
-	fmt.Printf("%d agents\n", len(agents.Msg.Agents))
+	fmt.Printf("%d agents\n", count)
 }
