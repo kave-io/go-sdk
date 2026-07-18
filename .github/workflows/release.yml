@@ -33,6 +33,7 @@ jobs:
           go-version-file: sdk/go/go.mod
           cache-dependency-path: |
             sdk/go/go.sum
+            sdk/go/v2/go.sum
             core/server/go.sum
             core/proto/gen/go.sum
 
@@ -43,6 +44,10 @@ jobs:
       - name: Test Go SDK
         working-directory: sdk/go
         run: go test ./...
+
+      - name: Test Go SDK V2
+        working-directory: sdk/go/v2
+        run: go test -race ./...
 
       - name: Build contract server image
         run: docker build --target server -t kave-server:contract core

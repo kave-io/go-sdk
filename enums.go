@@ -76,6 +76,7 @@ const (
 type CredentialSource string
 
 const (
+	CredentialSourceEnv         CredentialSource = "env"
 	CredentialSourceEncrypted   CredentialSource = "encrypted"
 	CredentialSourceVaultRef    CredentialSource = "vault_ref"
 	CredentialSourceOAuth       CredentialSource = "oauth"

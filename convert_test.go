@@ -55,6 +55,10 @@ func TestEnumRoundTrips(t *testing.T) {
 			t.Fatalf("ActionType round trip %q -> %q", a, got)
 		}
 	}
+
+	if got := credentialSourceTo(controlv1.CredentialSource(6)); got != CredentialSourceEnv {
+		t.Fatalf("env CredentialSource maps to %q", got)
+	}
 }
 
 func TestToAgentMapsOptionalFields(t *testing.T) {

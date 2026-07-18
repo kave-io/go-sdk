@@ -228,6 +228,11 @@ func budgetBehaviorTo(b controlv1.BudgetBehavior) BudgetBehavior {
 
 func credentialSourceTo(s controlv1.CredentialSource) CredentialSource {
 	switch s {
+	// CREDENTIAL_SOURCE_ENV was added to the V1 wire enum as value 6. Keep
+	// the numeric case so this SDK remains buildable with the preceding proto
+	// module while the generated module and SDK are released together.
+	case controlv1.CredentialSource(6):
+		return CredentialSourceEnv
 	case controlv1.CredentialSource_CREDENTIAL_SOURCE_ENCRYPTED:
 		return CredentialSourceEncrypted
 	case controlv1.CredentialSource_CREDENTIAL_SOURCE_VAULT_REF:

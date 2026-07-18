@@ -1,1 +1,3 @@
 gen/
+!v2/internal/gen/
+!v2/internal/gen/**
