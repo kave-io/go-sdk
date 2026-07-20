@@ -9,8 +9,8 @@ import (
 	"time"
 
 	connect "connectrpc.com/connect"
-	kernelv2 "github.com/kave-io/kave/sdk/go/v2/internal/gen"
-	"github.com/kave-io/kave/sdk/go/v2/internal/gen/kernelv2connect"
+	kernelv2 "github.com/kave-io/go-sdk/v2/internal/gen"
+	"github.com/kave-io/go-sdk/v2/internal/gen/kernelv2connect"
 )
 
 const (
@@ -138,6 +138,43 @@ type InvocationPage struct {
 	NextPageToken string
 }
 
+// TenantStatus is an operational status inferred from Kave accounting data.
+// It is not a customer lifecycle or human identity status.
+type TenantStatus string
+
+const (
+	// TenantStatusActive means at least one current limit targets the tenant or
+	// billing reference.
+	TenantStatusActive TenantStatus = "active"
+	// TenantStatusObserved means the pair appeared in the requested interval
+	// without a current targeted limit.
+	TenantStatusObserved TenantStatus = "observed"
+)
+
+// TenantQuery bounds a namespace-scoped tenant inventory query.
+type TenantQuery struct {
+	Range QueryRange
+	Page  Page
+}
+
+// TenantSummary contains opaque application-provided references and bounded
+// operational aggregates only. Kave does not attach human identity fields.
+type TenantSummary struct {
+	Tenant          Ref
+	BillTo          Ref
+	Status          TenantStatus
+	LastSeenAt      *time.Time
+	InvocationCount int64
+	RequestCount    int64
+	CostNanoUSD     int64
+	ActiveLimits    int32
+}
+
+type TenantPage struct {
+	Tenants       []TenantSummary
+	NextPageToken string
+}
+
 type AuditQuery struct {
 	EventKind Ref
 	Range     QueryRange
@@ -166,6 +203,7 @@ type kernelReader interface {
 	GetLimitStatus(context.Context, *connect.Request[kernelv2.GetLimitStatusRequest]) (*connect.Response[kernelv2.GetLimitStatusResponse], error)
 	QueryUsage(context.Context, *connect.Request[kernelv2.QueryUsageRequest]) (*connect.Response[kernelv2.QueryUsageResponse], error)
 	QueryInvocations(context.Context, *connect.Request[kernelv2.QueryInvocationsRequest]) (*connect.Response[kernelv2.QueryInvocationsResponse], error)
+	ListTenants(context.Context, *connect.Request[kernelv2.ListTenantsRequest]) (*connect.Response[kernelv2.ListTenantsResponse], error)
 	QueryAuditEvents(context.Context, *connect.Request[kernelv2.QueryAuditEventsRequest]) (*connect.Response[kernelv2.QueryAuditEventsResponse], error)
 }
 
@@ -238,7 +276,8 @@ func (c *Client) GetLimitStatus(ctx context.Context, agent Agent, metric Metric,
 	}
 	result := make([]LimitStatus, 0, len(response.Msg.GetLimits()))
 	for _, limit := range response.Msg.GetLimits() {
-		if limit == nil || limit.GetLimitId() == "" || limit.GetLimitKey() == "" || limit.GetMetric() == "" || limit.GetResetAtMs() <= 0 {
+		if limit == nil || Ref(limit.GetLimitId()).Validate() != nil || Ref(limit.GetLimitKey()).Validate() != nil ||
+			Metric(limit.GetMetric()).Validate() != nil || limit.GetResetAtMs() <= 0 {
 			return nil, ErrInvalidResponse
 		}
 		var soft *int64
@@ -304,8 +343,36 @@ func (c *Client) QueryUsage(ctx context.Context, query UsageQuery) (UsagePage, e
 		if entry.GetUnits() < 0 || entry.GetRequestCount() < 0 || entry.GetInputTokens() < 0 ||
 			entry.GetOutputTokens() < 0 || entry.GetCacheReadTokens() < 0 ||
 			entry.GetCacheWriteTokens() < 0 || entry.GetReasoningTokens() < 0 ||
-			entry.GetCostNanoUsd() < 0 || entry.GetAttempt() < 0 {
+			entry.GetCostNanoUsd() < 0 || entry.GetAttempt() < 0 ||
+			entry.GetCacheReadTokens() > entry.GetInputTokens() ||
+			entry.GetCacheWriteTokens() > entry.GetInputTokens() ||
+			entry.GetReasoningTokens() > entry.GetOutputTokens() {
 			return UsagePage{}, ErrInvalidResponse
+		}
+		if err := Ref(entry.GetId()).Validate(); err != nil {
+			return UsagePage{}, ErrInvalidResponse
+		}
+		if err := Ref(entry.GetInvocationId()).Validate(); err != nil {
+			return UsagePage{}, ErrInvalidResponse
+		}
+		if err := Ref(entry.GetEventKind()).Validate(); err != nil {
+			return UsagePage{}, ErrInvalidResponse
+		}
+		if entry.GetMetric() != "" {
+			if err := Metric(entry.GetMetric()).Validate(); err != nil {
+				return UsagePage{}, ErrInvalidResponse
+			}
+		}
+		if (entry.GetProvider() == "") != (entry.GetModel() == "") {
+			return UsagePage{}, ErrInvalidResponse
+		}
+		if entry.GetProvider() != "" {
+			if err := Ref(entry.GetProvider()).Validate(); err != nil {
+				return UsagePage{}, ErrInvalidResponse
+			}
+			if err := Ref(entry.GetModel()).Validate(); err != nil {
+				return UsagePage{}, ErrInvalidResponse
+			}
 		}
 		result.Entries = append(result.Entries, UsageEntry{
 			ID: entry.GetId(), InvocationID: entry.GetInvocationId(), Metric: Metric(entry.GetMetric()),
@@ -363,7 +430,8 @@ func (c *Client) QueryInvocations(ctx context.Context, query InvocationQuery) (I
 		return InvocationPage{}, err
 	}
 	for _, invocation := range response.Msg.GetInvocations() {
-		if invocation == nil || invocation.GetId() == "" || invocation.GetStatus() == "" || invocation.GetCreatedAtMs() <= 0 || invocation.GetScope() == nil {
+		if invocation == nil || Ref(invocation.GetId()).Validate() != nil || Ref(invocation.GetStatus()).Validate() != nil ||
+			invocation.GetCreatedAtMs() <= 0 || invocation.GetScope() == nil {
 			return InvocationPage{}, ErrInvalidResponse
 		}
 		decision := decisionStatusFromProto(invocation.GetDecision())
@@ -377,6 +445,11 @@ func (c *Client) QueryInvocations(ctx context.Context, query InvocationQuery) (I
 		if err := Agent(invocation.GetAgent()).Validate(); err != nil {
 			return InvocationPage{}, ErrInvalidResponse
 		}
+		if invocation.GetModel() != "" {
+			if err := Ref(invocation.GetModel()).Validate(); err != nil {
+				return InvocationPage{}, ErrInvalidResponse
+			}
+		}
 		if err := Ref(invocation.GetIdempotencyKey()).Validate(); err != nil {
 			return InvocationPage{}, ErrInvalidResponse
 		}
@@ -389,6 +462,74 @@ func (c *Client) QueryInvocations(ctx context.Context, query InvocationQuery) (I
 			ID: invocation.GetId(), Agent: Agent(invocation.GetAgent()), Model: Ref(invocation.GetModel()), Scope: itemScope,
 			Decision: decision, Status: Ref(invocation.GetStatus()), IdempotencyKey: Ref(invocation.GetIdempotencyKey()),
 			CreatedAt: createdAt, SettledAt: settledAt,
+		})
+	}
+	return result, nil
+}
+
+// ListTenants returns a bounded namespace-scoped inventory of opaque tenant
+// and billing reference pairs. The service key fixes the namespace, and the
+// method requires its usage.read capability.
+func (c *Client) ListTenants(ctx context.Context, query TenantQuery) (TenantPage, error) {
+	if err := c.validateRead(ctx); err != nil {
+		return TenantPage{}, err
+	}
+	if err := validateQueryBounds(query.Range, query.Page); err != nil {
+		return TenantPage{}, err
+	}
+	req := connect.NewRequest(&kernelv2.ListTenantsRequest{
+		FromMs: query.Range.From.UTC().UnixMilli(), ToMs: query.Range.To.UTC().UnixMilli(),
+		PageSize: int32(query.Page.Size), PageToken: query.Page.Token,
+	})
+	c.authorize(req)
+	response, err := c.reader.ListTenants(ctx, req)
+	if err != nil {
+		return TenantPage{}, normalizeError(err)
+	}
+	if response == nil || response.Msg == nil {
+		return TenantPage{}, ErrInvalidResponse
+	}
+	result := TenantPage{
+		Tenants:       make([]TenantSummary, 0, len(response.Msg.GetTenants())),
+		NextPageToken: response.Msg.GetNextPageToken(),
+	}
+	if err := validateNextToken(result.NextPageToken); err != nil {
+		return TenantPage{}, err
+	}
+	for _, summary := range response.Msg.GetTenants() {
+		if summary == nil || Ref(summary.GetTenant()).Validate() != nil || Ref(summary.GetBillTo()).Validate() != nil ||
+			summary.GetInvocationCount() < 0 || summary.GetRequestCount() < 0 ||
+			summary.GetCostNanoUsd() < 0 || summary.GetActiveLimits() < 0 {
+			return TenantPage{}, ErrInvalidResponse
+		}
+		status := TenantStatus(summary.GetStatus())
+		var lastSeenAt *time.Time
+		if summary.GetLastSeenAtMs() > 0 {
+			value := unixMilli(summary.GetLastSeenAtMs())
+			if value.Before(query.Range.From) || !value.Before(query.Range.To) {
+				return TenantPage{}, ErrInvalidResponse
+			}
+			lastSeenAt = &value
+		} else if summary.GetLastSeenAtMs() < 0 {
+			return TenantPage{}, ErrInvalidResponse
+		}
+		switch status {
+		case TenantStatusActive:
+			if summary.GetActiveLimits() == 0 {
+				return TenantPage{}, ErrInvalidResponse
+			}
+		case TenantStatusObserved:
+			if summary.GetActiveLimits() != 0 || lastSeenAt == nil {
+				return TenantPage{}, ErrInvalidResponse
+			}
+		default:
+			return TenantPage{}, ErrInvalidResponse
+		}
+		result.Tenants = append(result.Tenants, TenantSummary{
+			Tenant: Ref(summary.GetTenant()), BillTo: Ref(summary.GetBillTo()), Status: status,
+			LastSeenAt: lastSeenAt, InvocationCount: summary.GetInvocationCount(),
+			RequestCount: summary.GetRequestCount(), CostNanoUSD: summary.GetCostNanoUsd(),
+			ActiveLimits: summary.GetActiveLimits(),
 		})
 	}
 	return result, nil
@@ -423,8 +564,30 @@ func (c *Client) QueryAuditEvents(ctx context.Context, query AuditQuery) (AuditP
 		return AuditPage{}, err
 	}
 	for _, event := range response.Msg.GetEvents() {
-		if event == nil || event.GetId() == "" || event.GetEventKind() == "" || event.GetResourceKind() == "" || event.GetResourceId() == "" || event.GetOutcome() == "" || event.GetCreatedAtMs() <= 0 {
+		if event == nil || Ref(event.GetId()).Validate() != nil || Ref(event.GetEventKind()).Validate() != nil ||
+			Ref(event.GetActorKind()).Validate() != nil || Ref(event.GetResourceKind()).Validate() != nil ||
+			Ref(event.GetResourceId()).Validate() != nil || Ref(event.GetOutcome()).Validate() != nil || event.GetCreatedAtMs() <= 0 {
 			return AuditPage{}, ErrInvalidResponse
+		}
+		switch event.GetActorKind() {
+		case "bootstrap":
+			if event.GetActorId() != "" {
+				return AuditPage{}, ErrInvalidResponse
+			}
+		case "service_key":
+			if err := Ref(event.GetActorId()).Validate(); err != nil {
+				return AuditPage{}, ErrInvalidResponse
+			}
+		default:
+			return AuditPage{}, ErrInvalidResponse
+		}
+		if len(event.GetMetadata()) > 32 {
+			return AuditPage{}, ErrInvalidResponse
+		}
+		for key, value := range event.GetMetadata() {
+			if key == "" || len(key) > 64 || len(value) > 512 || strings.ContainsAny(key, "\x00\r\n") || strings.ContainsAny(value, "\x00\r\n") {
+				return AuditPage{}, ErrInvalidResponse
+			}
 		}
 		result.Events = append(result.Events, AuditEvent{
 			ID: event.GetId(), EventKind: Ref(event.GetEventKind()), ActorKind: Ref(event.GetActorKind()),
@@ -497,7 +660,10 @@ func manifestFromProto(input *kernelv2.Manifest) (Manifest, error) {
 			}
 			item.Pricing = append(item.Pricing, ModelPrice{
 				Model: Ref(price.GetModel()), InputNanosPerMillionTokens: price.GetInputNanosPerMillionTokens(),
-				OutputNanosPerMillionTokens: price.GetOutputNanosPerMillionTokens(),
+				OutputNanosPerMillionTokens:     price.GetOutputNanosPerMillionTokens(),
+				CacheReadNanosPerMillionTokens:  price.GetCacheReadNanosPerMillionTokens(),
+				CacheWriteNanosPerMillionTokens: price.GetCacheWriteNanosPerMillionTokens(),
+				ReasoningNanosPerMillionTokens:  price.GetReasoningNanosPerMillionTokens(),
 			})
 		}
 		manifest.Routes = append(manifest.Routes, item)

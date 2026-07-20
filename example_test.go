@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	kave "github.com/kave-io/kave/sdk/go/v2"
+	kave "github.com/kave-io/go-sdk/v2"
 )
 
 func Example() {

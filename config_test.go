@@ -1,8 +1,11 @@
 package kave
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -90,12 +93,44 @@ func TestOpenCopiesBaseHTTPClient(t *testing.T) {
 	if got == base {
 		t.Fatal("HTTPClient returned the caller's mutable client")
 	}
+	if got.Transport == nil || got.Transport == http.DefaultTransport {
+		t.Fatal("HTTPClient did not receive a private standard transport clone")
+	}
+}
+
+func TestConfigAndClientFormattingRedactsServiceKey(t *testing.T) {
+	t.Parallel()
+	cfg := validConfig("https://kave.example.test")
+	client, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, formatted := range map[string]string{
+		"config": fmt.Sprintf("%+v %#v", cfg, cfg),
+		"client": fmt.Sprintf("%+v %#v", client, client),
+	} {
+		if strings.Contains(formatted, cfg.ServiceKey) || !strings.Contains(formatted, "[REDACTED]") {
+			t.Fatalf("%s formatting did not redact service key: %s", name, formatted)
+		}
+	}
+	encoded, err := json.Marshal(cfg)
+	if err != nil || strings.Contains(string(encoded), cfg.ServiceKey) {
+		t.Fatalf("config JSON redaction failed: marshal=%v json=%s", err, encoded)
+	}
+	unsafe := cfg
+	unsafe.URL = "https://operator:url-password@kave.example.test"
+	if formatted := fmt.Sprintf("%+v %#v", unsafe, unsafe); strings.Contains(formatted, "url-password") {
+		t.Fatalf("config formatting leaked URL credentials: %s", formatted)
+	}
 }
 
 func TestOpenRejectsCustomTransportAfterSanitizationBoundary(t *testing.T) {
 	t.Parallel()
 	cfg := validConfig("https://kave.example.test")
 	cfg.HTTPClient = &http.Client{Transport: http.DefaultTransport}
+	if err := cfg.Validate(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Validate() error = %v, want ErrInvalidConfig", err)
+	}
 	if _, err := Open(cfg); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("Open() error = %v, want ErrInvalidConfig", err)
 	}

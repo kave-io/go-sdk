@@ -2,93 +2,217 @@ name: release-go-sdk
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v2.*.*"]
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: Exact kave-io/kave branch, tag, or commit to contract-test
+        required: true
+        type: string
 
 permissions:
   contents: read
-  packages: read
+
+concurrency:
+  group: release-go-sdk-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   GOTOOLCHAIN: auto
+  # Tag releases require the identical immutable core tag. A manual gate always
+  # requires an explicit ref.
+  KAVE_CORE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.core_ref || github.ref_name }}
+  KAVE_POSTGRES_ADMIN_DSN: postgres://postgres@127.0.0.1:5432/kave?sslmode=disable
+  KAVE_RUNTIME_POSTGRES_DSN: postgres://kave_runtime@127.0.0.1:5432/kave?sslmode=disable
+  KAVE_RUNTIME_POSTGRES_ROLE: kave_runtime
+  # The live contract owns an ephemeral loopback provider. Production must not
+  # copy this test-only egress exception.
+  KAVE_RUNTIME_PROVIDER_ALLOWED_PRIVATE_IPS: 127.0.0.1
+  KAVE_TEST_URL: http://127.0.0.1:18080
+  KAVE_TEST_ACCOUNT: account/sdk-contract
+  KAVE_TEST_APPLICATION: sdk-contract
+  KAVE_TEST_ENVIRONMENT: release
 
 jobs:
-  test:
+  contract:
+    name: Generated contract, race, and live kernel gate
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a
+        env:
+          POSTGRES_DB: kave
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kave"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+
     steps:
-      - name: Checkout Go SDK
-        uses: actions/checkout@v4
+      - name: Checkout Go SDK tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: sdk/go
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Checkout core
-        uses: actions/checkout@v4
+      - name: Checkout matching Kave core contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kave-io/kave
+          ref: ${{ env.KAVE_CORE_REF }}
           path: core
-          fetch-depth: 0
+          fetch-depth: 1
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - name: Record contract pair
+        run: |
+          set -euo pipefail
+          sdk_commit="$(git -C sdk/go rev-parse HEAD)"
+          core_commit="$(git -C core rev-parse HEAD)"
+          printf 'SDK %s (%s) -> core %s (%s)\n' \
+            "$GITHUB_REF_NAME" "$sdk_commit" "$KAVE_CORE_REF" "$core_commit"
+
+      - name: Verify release changelog
+        if: github.event_name == 'push'
+        working-directory: sdk/go
+        run: grep --fixed-strings --line-regexp "## ${GITHUB_REF_NAME#v}" CHANGELOG.md
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: sdk/go/go.mod
+          cache: true
           cache-dependency-path: |
             sdk/go/go.sum
-            sdk/go/v2/go.sum
-            core/server/go.sum
+            core/core/go.sum
             core/proto/gen/go.sum
+            core/server/go.sum
 
-      - name: Enforce changelog entry
-        working-directory: core
-        run: scripts/check-sdk-changelog.sh go "${GITHUB_REF_NAME}"
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: "1.69.0"
 
-      - name: Test Go SDK
-        working-directory: sdk/go
-        run: go test ./...
-
-      - name: Test Go SDK V2
-        working-directory: sdk/go/v2
-        run: go test -race ./...
-
-      - name: Build contract server image
-        run: docker build --target server -t kave-server:contract core
-
-      - name: Start contract server
+      - name: Install pinned release tools
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/kave-data"
-          docker run -d --name kave-contract \
-            -p 18080:18080 \
-            -p 19090:19090 \
-            -v "$RUNNER_TEMP/kave-data:/data" \
-            -e KAVE_SERVER_ADDR=0.0.0.0:18080 \
-            -e KAVE_GRPC_ADDR=0.0.0.0:19090 \
-            -e KAVE_DAEMON_ADDRESS=0.0.0.0:19090 \
-            -e KAVE_DAEMON_PROXY_ADDRESS=0.0.0.0:18081 \
-            -e KAVE_STORAGE_DEFAULTS_APP_PATH=/data/app.db \
-            -e KAVE_STORAGE_DEFAULTS_SPAN_PATH=/data/spans.duckdb \
-            kave-server:contract
+          mkdir -p "$RUNNER_TEMP/go-tools"
+          echo "$RUNNER_TEMP/go-tools" >> "$GITHUB_PATH"
+          GOBIN="$RUNNER_TEMP/go-tools" \
+            go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          GOBIN="$RUNNER_TEMP/go-tools" \
+            go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
+          GOBIN="$RUNNER_TEMP/go-tools" \
+            go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+          GOBIN="$RUNNER_TEMP/go-tools" \
+            go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+
+      - name: Verify generated SDK matches core
+        working-directory: core
+        run: |
+          set -euo pipefail
+          buf generate --template buf.gen.sdk-go.yaml \
+            --path proto/kave/kernel/v2/kernel.proto
+          git -C ../sdk/go diff --exit-code -- internal/gen
+          test -z "$(git -C ../sdk/go status --porcelain --untracked-files=all -- internal/gen)"
+
+      - name: Race-test the SDK
+        working-directory: sdk/go
+        run: go test -race -count=1 ./...
+
+      - name: Vet and statically analyze the SDK
+        working-directory: sdk/go
+        run: |
+          set -euo pipefail
+          go vet ./...
+          staticcheck ./...
+
+      - name: Check reachable Go vulnerabilities
+        working-directory: sdk/go
+        run: govulncheck ./...
+
+      - name: Build the matching Kave server
+        working-directory: core
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags="-s -w -X main.buildVersion=sdk-${GITHUB_REF_NAME}" \
+            -o "$RUNNER_TEMP/kave-server" ./server
+          "$RUNNER_TEMP/kave-server" version
+
+      - name: Create least-privilege database roles
+        run: |
+          set -euo pipefail
+          psql "$KAVE_POSTGRES_ADMIN_DSN" --set ON_ERROR_STOP=1 \
+            --command="CREATE ROLE kave_owner NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+          psql "$KAVE_POSTGRES_ADMIN_DSN" --set ON_ERROR_STOP=1 \
+            --command="CREATE ROLE kave_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+          psql "$KAVE_POSTGRES_ADMIN_DSN" --set ON_ERROR_STOP=1 \
+            --command="GRANT CREATE ON DATABASE kave TO kave_owner"
+          psql "$KAVE_POSTGRES_ADMIN_DSN" --set ON_ERROR_STOP=1 \
+            --command="GRANT CONNECT ON DATABASE kave TO kave_runtime"
+          psql "$KAVE_POSTGRES_ADMIN_DSN" --set ON_ERROR_STOP=1 \
+            --command="GRANT kave_owner TO postgres"
+
+      - name: Migrate with the dedicated owner
+        env:
+          KAVE_MIGRATION_POSTGRES_DSN: ${{ env.KAVE_POSTGRES_ADMIN_DSN }}
+          KAVE_MIGRATION_OWNER_ROLE: kave_owner
+        run: "$RUNNER_TEMP/kave-server migrate"
+
+      - name: Bootstrap the release-test namespace
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/kave-bootstrap"
+          output="$RUNNER_TEMP/kave-bootstrap/admin.key"
+          KAVE_BOOTSTRAP_ACCOUNT="$KAVE_TEST_ACCOUNT" \
+          KAVE_BOOTSTRAP_APPLICATION="$KAVE_TEST_APPLICATION" \
+          KAVE_BOOTSTRAP_ENVIRONMENT="$KAVE_TEST_ENVIRONMENT" \
+          KAVE_BOOTSTRAP_KEY_NAME=release-admin \
+          KAVE_BOOTSTRAP_OUTPUT="$output" \
+            "$RUNNER_TEMP/kave-server" bootstrap
+          admin_key="$(tr -d '\r\n' < "$output")"
+          test -n "$admin_key"
+          echo "::add-mask::$admin_key"
+          printf 'KAVE_TEST_SERVICE_KEY=%s\n' "$admin_key" >> "$GITHUB_ENV"
+
+      - name: Start the matching Kave runtime
+        run: |
+          set -euo pipefail
+          master_key="$(openssl rand -hex 32)"
+          idempotency_key="$(openssl rand -hex 32)"
+          KAVE_SERVER_ADDR=127.0.0.1:18080 \
+          KAVE_RUNTIME_MASTER_KEY="$master_key" \
+          KAVE_RUNTIME_SECRET_IDEMPOTENCY_KEY="$idempotency_key" \
+          KAVE_RUNTIME_TRANSPORT_SECURITY=development \
+            "$RUNNER_TEMP/kave-server" serve \
+            >"$RUNNER_TEMP/kave-server.log" 2>&1 &
+          printf '%s\n' "$!" > "$RUNNER_TEMP/kave-server.pid"
           for _ in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:18080/health >/dev/null; then
+            if curl -fsS "$KAVE_TEST_URL/readyz" >/dev/null; then
               exit 0
             fi
-            sleep 2
+            sleep 1
           done
-          docker logs kave-contract
+          cat "$RUNNER_TEMP/kave-server.log"
           exit 1
 
-      - name: Run contract tests
+      - name: Run the live SDK/kernel contract
         working-directory: sdk/go
-        env:
-          KAVE_CONTRACT_ADDR: http://127.0.0.1:18080
-        run: go test -tags contracts ./... -count=1 -timeout=120s
+        run: >-
+          go test -race -tags=integration -count=1 -timeout=3m
+          -run '^TestLiveKernelContract$' ./...
 
-      - name: Verify clean go install
-        run: |
-          set -euo pipefail
-          tmp="$(mktemp -d)"
-          GOMODCACHE="$tmp/mod" GOCACHE="$tmp/build" \
-            go install "github.com/kave-io/go-sdk/examples/bootstrap@${GITHUB_REF_NAME}"
+      - name: Show runtime log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/kave-server.log" || true
 
-      - name: Stop contract server
+      - name: Stop the runtime
         if: always()
-        run: docker rm -f kave-contract || true
+        run: |
+          if test -f "$RUNNER_TEMP/kave-server.pid"; then
+            kill "$(cat "$RUNNER_TEMP/kave-server.pid")" || true
+          fi

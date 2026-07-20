@@ -8,11 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	connect "connectrpc.com/connect"
-	kernelv2 "github.com/kave-io/kave/sdk/go/v2/internal/gen"
+	kernelv2 "github.com/kave-io/go-sdk/v2/internal/gen"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -22,6 +23,7 @@ type fakeKernelController struct {
 	issue        func(context.Context, *connect.Request[kernelv2.IssueServiceKeyRequest]) (*connect.Response[kernelv2.IssuedServiceKey], error)
 	revokeKey    func(context.Context, *connect.Request[kernelv2.RevokeServiceKeyRequest]) (*connect.Response[emptypb.Empty], error)
 	revokeSecret func(context.Context, *connect.Request[kernelv2.RevokeSecretRequest]) (*connect.Response[emptypb.Empty], error)
+	activate     func(context.Context, *connect.Request[kernelv2.ActivateProviderRouteRequest]) (*connect.Response[kernelv2.ProviderRouteActivation], error)
 	sync         func(context.Context, *connect.Request[kernelv2.SyncLimitsRequest]) (*connect.Response[kernelv2.SyncLimitsResponse], error)
 }
 
@@ -39,6 +41,9 @@ func (f fakeKernelController) RevokeServiceKey(ctx context.Context, req *connect
 }
 func (f fakeKernelController) RevokeSecret(ctx context.Context, req *connect.Request[kernelv2.RevokeSecretRequest]) (*connect.Response[emptypb.Empty], error) {
 	return f.revokeSecret(ctx, req)
+}
+func (f fakeKernelController) ActivateProviderRoute(ctx context.Context, req *connect.Request[kernelv2.ActivateProviderRouteRequest]) (*connect.Response[kernelv2.ProviderRouteActivation], error) {
+	return f.activate(ctx, req)
 }
 func (f fakeKernelController) SyncLimits(ctx context.Context, req *connect.Request[kernelv2.SyncLimitsRequest]) (*connect.Response[kernelv2.SyncLimitsResponse], error) {
 	return f.sync(ctx, req)
@@ -59,22 +64,37 @@ func TestApplySendsOneDeclarativeManifest(t *testing.T) {
 			t.Fatalf("request = %+v", req.Msg)
 		}
 		price := req.Msg.GetManifest().GetRoutes()[0].GetPricing()
-		if len(price) != 1 || price[0].GetModel() != "gpt-5" || price[0].GetInputNanosPerMillionTokens() != 1_250_000_000 {
+		if len(price) != 1 || price[0].GetModel() != "gpt-5" ||
+			price[0].GetInputNanosPerMillionTokens() != 1_250_000_000 ||
+			price[0].GetOutputNanosPerMillionTokens() != 10_000_000_000 ||
+			price[0].GetCacheReadNanosPerMillionTokens() != 125_000_000 ||
+			price[0].GetCacheWriteNanosPerMillionTokens() != 2_500_000_000 ||
+			price[0].GetReasoningNanosPerMillionTokens() != 12_000_000_000 {
 			t.Fatalf("pricing = %+v", price)
 		}
-		return connect.NewResponse(&kernelv2.ApplyResponse{NamespaceId: "nsp_test", Revision: 2, Applied: true}), nil
+		return connect.NewResponse(&kernelv2.ApplyResponse{
+			NamespaceId: "nsp_test", Revision: 2, Applied: true,
+			Changes: []*kernelv2.Change{{Kind: kernelv2.ChangeKind_CHANGE_KIND_CREATE, ResourceKind: "agent", Name: "clinic-assistant"}},
+		}), nil
 	}
 	client := controlTestClient(controller)
 	result, err := client.Apply(context.Background(), Manifest{
 		Namespace: Namespace{Account: "account/acme", Application: "simorq", Environment: "production"},
 		Routes: []Route{{
 			Name: "openai", Provider: "openai", Secret: "openai", AllowedModels: []string{"gpt-5"}, DefaultModel: "gpt-5",
-			PricingRevision: 1, Pricing: []ModelPrice{{Model: "gpt-5", InputNanosPerMillionTokens: 1_250_000_000, OutputNanosPerMillionTokens: 10_000_000_000}},
+			PricingRevision: 1, Pricing: []ModelPrice{{
+				Model: "gpt-5", InputNanosPerMillionTokens: 1_250_000_000,
+				OutputNanosPerMillionTokens:     10_000_000_000,
+				CacheReadNanosPerMillionTokens:  125_000_000,
+				CacheWriteNanosPerMillionTokens: 2_500_000_000,
+				ReasoningNanosPerMillionTokens:  12_000_000_000,
+			}},
 		}},
 		Agents: []AgentSpec{{Name: "clinic-assistant", Kind: AgentLLM, Route: "openai", Enabled: true}},
 		Limits: []Limit{{Key: "requests", Metric: MetricRequests, Selector: LimitSelector{Agent: "clinic-assistant"}, Window: WindowMonth, HardCap: 10, Enabled: true}},
 	}, Once("deploy/1"))
-	if err != nil || result.NamespaceID != "nsp_test" || result.Revision != 2 {
+	if err != nil || result.NamespaceID != "nsp_test" || result.Revision != 2 || len(result.Changes) != 1 ||
+		result.Changes[0].Kind != ChangeCreate || result.Changes[0].ResourceKind != "agent" || result.Changes[0].Name != "clinic-assistant" {
 		t.Fatalf("Apply() = %+v, %v", result, err)
 	}
 }
@@ -171,14 +191,86 @@ func TestPutEncryptedSecretCopiesAndClearsRequestMaterial(t *testing.T) {
 	controller := fakeKernelController{}
 	controller.put = func(_ context.Context, req *connect.Request[kernelv2.PutSecretRequest]) (*connect.Response[kernelv2.SecretMetadata], error) {
 		captured = slices.Clone(req.Msg.GetPlaintext())
-		return connect.NewResponse(&kernelv2.SecretMetadata{Id: "sec_1", Name: "openai", Status: "active"}), nil
+		return connect.NewResponse(&kernelv2.SecretMetadata{
+			Id: "sec_1", Name: "openai", Source: kernelv2.SecretSource_SECRET_SOURCE_ENCRYPTED,
+			Version: 1, Status: "active", UpdatedAtMs: time.Unix(1_700_000_000, 0).UnixMilli(),
+		}), nil
 	}
 	metadata, err := controlTestClient(controller).PutEncryptedSecret(context.Background(), "nsp_test", "openai", original, Once("secret/1"))
-	if err != nil || metadata.ID != "sec_1" || string(captured) != "provider-secret" {
+	if err != nil || metadata.ID != "sec_1" || metadata.Source != SecretEncrypted || metadata.Version != 1 || string(captured) != "provider-secret" {
 		t.Fatalf("PutEncryptedSecret() = %+v, %v, captured=%q", metadata, err, captured)
 	}
 	if string(original) != "provider-secret" {
 		t.Fatal("caller-owned secret was mutated")
+	}
+}
+
+func TestPutExternalSecretValidatesAndTypesMetadata(t *testing.T) {
+	t.Parallel()
+	transportCalls := 0
+	controller := fakeKernelController{put: func(_ context.Context, req *connect.Request[kernelv2.PutSecretRequest]) (*connect.Response[kernelv2.SecretMetadata], error) {
+		transportCalls++
+		if req.Msg.GetExternalUri() != "vault://production/openai" || len(req.Msg.GetPlaintext()) != 0 {
+			t.Fatalf("request = %+v", req.Msg)
+		}
+		return connect.NewResponse(&kernelv2.SecretMetadata{
+			Id: "sec_external", Name: "provider-ref", Source: kernelv2.SecretSource_SECRET_SOURCE_EXTERNAL,
+			Version: 4, Status: "active", UpdatedAtMs: time.Unix(1_700_000_000, 0).UnixMilli(),
+		}), nil
+	}}
+	metadata, err := controlTestClient(controller).PutExternalSecret(
+		context.Background(), "nsp_test", "provider-ref", "vault://production/openai", Once("secret/external/1"),
+	)
+	if err != nil || metadata.ID != "sec_external" || metadata.Source != SecretExternal || metadata.Version != 4 {
+		t.Fatalf("PutExternalSecret() = %+v, %v", metadata, err)
+	}
+	for _, uri := range []string{"", "https://example.com/secret", "vault://user:pass@production/openai", "vault://production/openai\n"} {
+		if _, err := controlTestClient(controller).PutExternalSecret(context.Background(), "nsp_test", "provider-ref", uri, Once("secret/external/invalid")); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("PutExternalSecret(%q) error = %v", uri, err)
+		}
+	}
+	if transportCalls != 1 {
+		t.Fatalf("transport calls = %d, want 1", transportCalls)
+	}
+}
+
+func TestPutSecretRejectsOversizeAndUnboundMetadata(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	controller := fakeKernelController{put: func(context.Context, *connect.Request[kernelv2.PutSecretRequest]) (*connect.Response[kernelv2.SecretMetadata], error) {
+		calls++
+		return connect.NewResponse(&kernelv2.SecretMetadata{
+			Id: "sec_one", Name: "different", Source: kernelv2.SecretSource_SECRET_SOURCE_ENCRYPTED,
+			Version: 1, Status: "active", UpdatedAtMs: time.Now().UTC().UnixMilli(),
+		}), nil
+	}}
+	client := controlTestClient(controller)
+	if _, err := client.PutEncryptedSecret(context.Background(), "nsp_test", "openai", make([]byte, (64<<10)+1), Once("secret/large")); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized secret error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatal("oversized secret reached transport")
+	}
+	if _, err := client.PutEncryptedSecret(context.Background(), "nsp_test", "openai", []byte("value"), Once("secret/unbound")); !errors.Is(err, ErrInvalidResponse) {
+		t.Fatalf("unbound metadata error = %v", err)
+	}
+}
+
+func TestSyncLimitsReturnsBoundRevisionAndCounters(t *testing.T) {
+	t.Parallel()
+	controller := fakeKernelController{sync: func(_ context.Context, req *connect.Request[kernelv2.SyncLimitsRequest]) (*connect.Response[kernelv2.SyncLimitsResponse], error) {
+		if req.Msg.GetNamespaceId() != "nsp_test" || req.Msg.GetOwner() != "billing" || req.Msg.GetRevision() != 9 ||
+			req.Msg.GetIdempotencyKey() != "limits/9" || len(req.Msg.GetLimits()) != 1 || req.Header().Get("Authorization") == "" {
+			t.Fatalf("request = %+v headers=%v", req.Msg, req.Header())
+		}
+		return connect.NewResponse(&kernelv2.SyncLimitsResponse{Revision: 9, Created: 1, Updated: 2, Disabled: 3}), nil
+	}}
+	result, err := controlTestClient(controller).SyncLimits(context.Background(), "nsp_test", "billing", 9, []Limit{{
+		Key: "tenant-cap", Metric: MetricRequests, Selector: LimitSelector{Tenant: "tenant/one"},
+		Window: WindowMonth, HardCap: 100, Enabled: true,
+	}}, Once("limits/9"))
+	if err != nil || result.Revision != 9 || result.Created != 1 || result.Updated != 2 || result.Disabled != 3 {
+		t.Fatalf("SyncLimits() = %+v, %v", result, err)
 	}
 }
 
@@ -202,7 +294,7 @@ func TestIssueServiceKeyDistinguishesCreationFromReplay(t *testing.T) {
 		}), nil
 	}}
 	issued, err := controlTestClient(controller).IssueServiceKey(context.Background(), "nsp_test", ServiceKeySpec{
-		Name: "worker", Operations: []Operation{OperationApply},
+		Name: "worker", Operations: []Operation{OperationConfigApply},
 	}, Once("key/worker/1"))
 	if err != nil || !issued.Created || issued.RawKey == "" || !issued.CreatedAt.Equal(createdAt) {
 		t.Fatalf("IssueServiceKey() = %+v, %v", issued, err)
@@ -215,6 +307,15 @@ func TestIssueServiceKeyDistinguishesCreationFromReplay(t *testing.T) {
 	if err != nil || bytes.Contains(encoded, []byte(issued.RawKey)) {
 		t.Fatalf("JSON redaction failed: marshal=%v contains_raw=%v", err, bytes.Contains(encoded, []byte(issued.RawKey)))
 	}
+	formatted := fmt.Sprintf("%+v %#v", issued, issued)
+	if strings.Contains(formatted, issued.RawKey) || !strings.Contains(formatted, "[REDACTED]") {
+		t.Fatalf("formatted issued key was not redacted: %s", formatted)
+	}
+	spec := ServiceKeySpec{Name: "worker", Operations: []Operation{OperationConfigApply}, RawKey: issued.RawKey}
+	formatted = fmt.Sprintf("%+v %#v", spec, spec)
+	if strings.Contains(formatted, issued.RawKey) || !strings.Contains(formatted, "[REDACTED]") {
+		t.Fatalf("formatted key spec was not redacted: %s", formatted)
+	}
 
 	controller.issue = func(_ context.Context, req *connect.Request[kernelv2.IssueServiceKeyRequest]) (*connect.Response[kernelv2.IssuedServiceKey], error) {
 		material, err := parseServiceKeyMaterial(issued.RawKey)
@@ -223,7 +324,7 @@ func TestIssueServiceKeyDistinguishesCreationFromReplay(t *testing.T) {
 		}
 		return connect.NewResponse(&kernelv2.IssuedServiceKey{Id: "key_1", Name: "worker", Prefix: issued.Prefix, CreatedAtMs: createdAt.UnixMilli()}), nil
 	}
-	replayed, err := controlTestClient(controller).IssueServiceKey(context.Background(), "nsp_test", ServiceKeySpec{Name: "worker", Operations: []Operation{OperationApply}, RawKey: issued.RawKey}, Once("key/worker/1"))
+	replayed, err := controlTestClient(controller).IssueServiceKey(context.Background(), "nsp_test", ServiceKeySpec{Name: "worker", Operations: []Operation{OperationConfigApply}, RawKey: issued.RawKey}, Once("key/worker/1"))
 	if err != nil || replayed.Created || replayed.RawKey != issued.RawKey || replayed.Prefix != issued.Prefix {
 		t.Fatalf("replayed IssueServiceKey() = %+v, %v", replayed, err)
 	}
@@ -235,7 +336,7 @@ func TestIssueServiceKeyReturnsLocalMaterialOnAmbiguousTransportError(t *testing
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("response lost"))
 	}}
 	pending, err := controlTestClient(controller).IssueServiceKey(context.Background(), "nsp_test", ServiceKeySpec{
-		Name: "worker", Operations: []Operation{OperationApply},
+		Name: "worker", Operations: []Operation{OperationConfigApply},
 	}, Once("key/worker/ambiguous"))
 	if !errors.Is(err, ErrUnavailable) || pending.RawKey == "" || pending.Prefix == "" {
 		t.Fatalf("IssueServiceKey() = %+v, %v", pending, err)
@@ -264,6 +365,7 @@ func TestIssueServiceKeyValidatesOperationsAndAgentAllowlistBeforeNetwork(t *tes
 		transportCalls++
 		return connect.NewResponse(&kernelv2.IssuedServiceKey{
 			Id: "key_worker", Name: req.Msg.GetName(), Prefix: "kv2_" + req.Msg.GetLookupPrefix(), Created: true,
+			CreatedAtMs: time.Unix(1_700_000_000, 0).UnixMilli(),
 		}), nil
 	}}
 	client := controlTestClient(controller)
@@ -336,6 +438,10 @@ func TestIssueServiceKeyValidatesOperationsAndAgentAllowlistBeforeNetwork(t *tes
 			name: "resource ref used as allowed-agent name", namespaceID: "nsp_test",
 			spec: ServiceKeySpec{Name: "worker", Operations: []Operation{OperationUsageRead}, AllowedAgents: []Agent{"assistant/one"}},
 		},
+		{
+			name: "expired key", namespaceID: "nsp_test",
+			spec: ServiceKeySpec{Name: "worker", Operations: []Operation{OperationUsageRead}, ExpiresAt: time.Now().Add(-time.Minute)},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -376,6 +482,90 @@ func TestTypedRevocationsValidateAndAuthorize(t *testing.T) {
 	}
 	if err := client.RevokeSecret(context.Background(), "sec_openai", "bad\nreason"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("newline reason error = %v", err)
+	}
+}
+
+func TestActivateProviderRouteReturnsBoundEvidence(t *testing.T) {
+	t.Parallel()
+	validatedAt := time.Unix(1_750_000_000, 0).UTC()
+	controller := fakeKernelController{activate: func(_ context.Context, req *connect.Request[kernelv2.ActivateProviderRouteRequest]) (*connect.Response[kernelv2.ProviderRouteActivation], error) {
+		if req.Header().Get("Authorization") != "Bearer kv2_test.secret" ||
+			req.Msg.GetNamespaceId() != "nsp_test" || req.Msg.GetRoute() != "openai" || req.Msg.GetModel() != "gpt-5" {
+			t.Fatalf("activation request = %+v headers=%v", req.Msg, req.Header())
+		}
+		return connect.NewResponse(&kernelv2.ProviderRouteActivation{
+			RouteId: "rte_01", Route: "openai", Provider: "openai", Model: "gpt-5", Status: "active",
+			RouteRevision: 3, SecretVersion: 2, ValidatedAtMs: validatedAt.UnixMilli(), ProviderRequestId: "req-safe-123",
+		}), nil
+	}}
+
+	activation, err := controlTestClient(controller).ActivateProviderRoute(context.Background(), "nsp_test", "openai", "gpt-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activation.RouteID != "rte_01" || activation.Route != "openai" || activation.Provider != "openai" ||
+		activation.Model != "gpt-5" || activation.Status != ProviderRouteActive || activation.RouteRevision != 3 ||
+		activation.SecretVersion != 2 || !activation.ValidatedAt.Equal(validatedAt) || activation.ProviderRequestID != "req-safe-123" {
+		t.Fatalf("activation = %+v", activation)
+	}
+}
+
+func TestActivateProviderRouteRejectsUnboundOrMalformedEvidence(t *testing.T) {
+	t.Parallel()
+	valid := func() *kernelv2.ProviderRouteActivation {
+		return &kernelv2.ProviderRouteActivation{
+			RouteId: "rte_01", Route: "openai", Provider: "openai", Model: "gpt-5", Status: "active",
+			RouteRevision: 3, SecretVersion: 2, ValidatedAtMs: time.Now().UTC().UnixMilli(), ProviderRequestId: "req-safe",
+		}
+	}
+	tests := []struct {
+		name   string
+		mutate func(*kernelv2.ProviderRouteActivation)
+	}{
+		{name: "wrong route", mutate: func(value *kernelv2.ProviderRouteActivation) { value.Route = "other" }},
+		{name: "wrong model", mutate: func(value *kernelv2.ProviderRouteActivation) { value.Model = "other" }},
+		{name: "inactive", mutate: func(value *kernelv2.ProviderRouteActivation) { value.Status = "invalid" }},
+		{name: "missing revision", mutate: func(value *kernelv2.ProviderRouteActivation) { value.RouteRevision = 0 }},
+		{name: "missing secret version", mutate: func(value *kernelv2.ProviderRouteActivation) { value.SecretVersion = 0 }},
+		{name: "missing validation time", mutate: func(value *kernelv2.ProviderRouteActivation) { value.ValidatedAtMs = 0 }},
+		{name: "header injection", mutate: func(value *kernelv2.ProviderRouteActivation) { value.ProviderRequestId = "safe\r\nX-Evil: yes" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := valid()
+			test.mutate(value)
+			controller := fakeKernelController{activate: func(context.Context, *connect.Request[kernelv2.ActivateProviderRouteRequest]) (*connect.Response[kernelv2.ProviderRouteActivation], error) {
+				return connect.NewResponse(value), nil
+			}}
+			if _, err := controlTestClient(controller).ActivateProviderRoute(context.Background(), "nsp_test", "openai", "gpt-5"); !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("ActivateProviderRoute() error = %v, want invalid response", err)
+			}
+		})
+	}
+}
+
+func TestActivateProviderRouteValidatesInputBeforeNetwork(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	controller := fakeKernelController{activate: func(context.Context, *connect.Request[kernelv2.ActivateProviderRouteRequest]) (*connect.Response[kernelv2.ProviderRouteActivation], error) {
+		calls++
+		return nil, nil
+	}}
+	client := controlTestClient(controller)
+	for _, test := range []struct {
+		namespace    string
+		route, model Ref
+	}{
+		{namespace: "bad namespace", route: "openai", model: "gpt-5"},
+		{namespace: "nsp_test", route: "openai/invalid", model: "gpt-5"},
+		{namespace: "nsp_test", route: "openai", model: "bad model"},
+	} {
+		if _, err := client.ActivateProviderRoute(context.Background(), test.namespace, test.route, test.model); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("ActivateProviderRoute(%q, %q, %q) error = %v", test.namespace, test.route, test.model, err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("invalid activation made %d transport calls", calls)
 	}
 }
 

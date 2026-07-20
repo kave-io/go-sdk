@@ -7,8 +7,8 @@ import (
 	"net/http"
 
 	connect "connectrpc.com/connect"
-	kernelv2 "github.com/kave-io/kave/sdk/go/v2/internal/gen"
-	"github.com/kave-io/kave/sdk/go/v2/internal/gen/kernelv2connect"
+	kernelv2 "github.com/kave-io/go-sdk/v2/internal/gen"
+	"github.com/kave-io/go-sdk/v2/internal/gen/kernelv2connect"
 )
 
 // Idempotency identifies one logical consumption. Construct it with Once.
@@ -98,7 +98,7 @@ func (e *LimitExceededError) Error() string {
 }
 
 // Is makes errors.Is(err, ErrLimitExceeded) work while Unwrap preserves the
-// underlying Connect error for callers that also need its protocol code.
+// transport-neutral protocol failure returned by Kave.
 func (e *LimitExceededError) Is(target error) bool {
 	return target == ErrLimitExceeded
 }
@@ -195,7 +195,10 @@ func (c *Client) Consume(ctx context.Context, agent Agent, metric Metric, units 
 		return Decision{}, ErrInvalidResponse
 	}
 
-	decision := decisionFromProto(response.Msg)
+	decision, err := decisionFromProto(response.Msg)
+	if err != nil {
+		return Decision{}, err
+	}
 	switch decision.Status {
 	case DecisionAdmitted:
 		return decision, nil
@@ -221,49 +224,72 @@ func rejectedDecisionFromError(err error) (Decision, bool) {
 		if !ok {
 			continue
 		}
+		if err := Ref(exceeded.GetInvocationId()).Validate(); err != nil {
+			continue
+		}
+		violations, err := violationsFromProto(exceeded.GetViolations())
+		if err != nil || len(violations) == 0 {
+			continue
+		}
 		decision.InvocationID = exceeded.GetInvocationId()
-		decision.Violations = violationsFromProto(exceeded.GetViolations())
-		if decision.InvocationID != "" && len(decision.Violations) > 0 {
+		decision.Violations = violations
+		if len(decision.Violations) > 0 {
 			return decision, true
 		}
 	}
 	return decision, false
 }
 
-func decisionFromProto(response *kernelv2.ConsumeResponse) Decision {
+func decisionFromProto(response *kernelv2.ConsumeResponse) (Decision, error) {
+	if response == nil || Ref(response.GetInvocationId()).Validate() != nil {
+		return Decision{}, ErrInvalidResponse
+	}
 	status := DecisionStatus("")
 	switch response.GetStatus() {
 	case kernelv2.DecisionStatus_DECISION_STATUS_ADMITTED:
 		status = DecisionAdmitted
 	case kernelv2.DecisionStatus_DECISION_STATUS_REJECTED:
 		status = DecisionRejected
+	default:
+		return Decision{}, ErrInvalidResponse
 	}
 	warnings := make([]LimitWarning, 0, len(response.GetWarnings()))
 	for _, warning := range response.GetWarnings() {
-		if warning == nil {
-			continue
+		if warning == nil || Ref(warning.GetLimitId()).Validate() != nil || Ref(warning.GetLimitKey()).Validate() != nil ||
+			warning.GetUsed() < 0 || warning.GetSoftCap() < 0 || warning.GetUsed() < warning.GetSoftCap() || warning.GetResetAtMs() <= 0 {
+			return Decision{}, ErrInvalidResponse
 		}
 		warnings = append(warnings, LimitWarning{
 			LimitID: warning.GetLimitId(), LimitKey: Ref(warning.GetLimitKey()),
 			Used: warning.GetUsed(), SoftCap: warning.GetSoftCap(), ResetAtMS: warning.GetResetAtMs(),
 		})
 	}
+	violations, err := violationsFromProto(response.GetViolations())
+	if err != nil {
+		return Decision{}, err
+	}
+	if (status == DecisionAdmitted && len(violations) != 0) || (status == DecisionRejected && len(violations) == 0) {
+		return Decision{}, ErrInvalidResponse
+	}
 	return Decision{
 		InvocationID: response.GetInvocationId(), Status: status, Replayed: response.GetReplayed(),
-		Warnings: warnings, Violations: violationsFromProto(response.GetViolations()),
-	}
+		Warnings: warnings, Violations: violations,
+	}, nil
 }
 
-func violationsFromProto(violations []*kernelv2.LimitViolation) []LimitViolation {
+func violationsFromProto(violations []*kernelv2.LimitViolation) ([]LimitViolation, error) {
 	result := make([]LimitViolation, 0, len(violations))
 	for _, violation := range violations {
-		if violation == nil {
-			continue
+		if violation == nil || Ref(violation.GetLimitId()).Validate() != nil || Ref(violation.GetLimitKey()).Validate() != nil ||
+			Metric(violation.GetMetric()).Validate() != nil || violation.GetUsed() < 0 || violation.GetRequested() <= 0 ||
+			violation.GetHardCap() < 0 || violation.GetResetAtMs() <= 0 ||
+			(violation.GetUsed() <= violation.GetHardCap() && violation.GetRequested() <= violation.GetHardCap()-violation.GetUsed()) {
+			return nil, ErrInvalidResponse
 		}
 		result = append(result, LimitViolation{
 			LimitID: violation.GetLimitId(), LimitKey: Ref(violation.GetLimitKey()), Metric: Metric(violation.GetMetric()),
 			Used: violation.GetUsed(), Requested: violation.GetRequested(), HardCap: violation.GetHardCap(), ResetAtMS: violation.GetResetAtMs(),
 		})
 	}
-	return result
+	return result, nil
 }

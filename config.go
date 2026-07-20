@@ -22,9 +22,9 @@ const (
 // embedded credentials. Plain HTTP is accepted only for loopback origins or
 // when AllowInsecure is explicitly enabled.
 type Config struct {
-	URL           string
-	ServiceKey    string
-	HTTPClient    *http.Client
+	URL           string       `json:"-"`
+	ServiceKey    string       `json:"-"`
+	HTTPClient    *http.Client `json:"-"`
 	AllowInsecure bool
 }
 
@@ -38,10 +38,27 @@ type Client struct {
 	reader     kernelReader
 }
 
+func (cfg Config) String() string {
+	return fmt.Sprintf("{URLSet:%t ServiceKey:[REDACTED] HTTPClient:%t AllowInsecure:%t}", cfg.URL != "", cfg.HTTPClient != nil, cfg.AllowInsecure)
+}
+
+func (cfg Config) GoString() string { return cfg.String() }
+
+func (c *Client) String() string {
+	if c == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("{URL:%q ServiceKey:[REDACTED]}", c.endpoint.String())
+}
+
+func (c *Client) GoString() string { return c.String() }
+
 // Validate verifies that the configuration is complete and safe.
 func (cfg Config) Validate() error {
-	_, err := cfg.validatedEndpoint()
-	return err
+	if _, err := cfg.validatedEndpoint(); err != nil {
+		return err
+	}
+	return cfg.validateHTTPClient()
 }
 
 // Open constructs a Kave V2 client from an explicit configuration.
@@ -50,14 +67,22 @@ func Open(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := cfg.validateHTTPClient(); err != nil {
+		return nil, err
+	}
 
-	base := *http.DefaultClient
+	base := http.Client{}
 	if cfg.HTTPClient != nil {
-		if cfg.HTTPClient.Transport != nil {
-			return nil, fmt.Errorf("%w: custom HTTPClient transports are not accepted because they run after credential sanitization", ErrInvalidConfig)
-		}
 		base = *cfg.HTTPClient
 	}
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || defaultTransport == nil {
+		return nil, fmt.Errorf("%w: standard HTTP transport is unavailable", ErrInvalidConfig)
+	}
+	// Never retain the process-global mutable transport. A private clone keeps
+	// connection pooling and proxy/TLS defaults while preventing unrelated code
+	// from changing the credential-bearing transport after Open returns.
+	base.Transport = defaultTransport.Clone()
 
 	client := &Client{
 		endpoint:   *endpoint,
@@ -68,6 +93,16 @@ func Open(cfg Config) (*Client, error) {
 	client.controller = newKernelController(client)
 	client.reader = newKernelReader(client)
 	return client, nil
+}
+
+func (cfg Config) validateHTTPClient() error {
+	if cfg.HTTPClient != nil && cfg.HTTPClient.Transport != nil {
+		return fmt.Errorf("%w: custom HTTPClient transports are not accepted because they run after credential sanitization", ErrInvalidConfig)
+	}
+	if transport, ok := http.DefaultTransport.(*http.Transport); !ok || transport == nil {
+		return fmt.Errorf("%w: standard HTTP transport is unavailable", ErrInvalidConfig)
+	}
+	return nil
 }
 
 // OpenFromEnv constructs a client from KAVE_URL and KAVE_SERVICE_KEY. The

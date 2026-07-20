@@ -2,517 +2,912 @@ package kave
 
 import (
 	"context"
-	"iter"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+	"time"
 
-	"connectrpc.com/connect"
-	commonv1 "github.com/kave-io/kave/proto/gen/kave/common/v1"
-	controlv1 "github.com/kave-io/kave/proto/gen/kave/control/v1"
+	connect "connectrpc.com/connect"
+	kernelv2 "github.com/kave-io/go-sdk/v2/internal/gen"
+	"github.com/kave-io/go-sdk/v2/internal/gen/kernelv2connect"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-const defaultPageSize int32 = 100
+type AgentKind string
 
-// EnsureOrganization returns the organization matching the input's slug or name,
-// creating it if absent.
-func (c *Client) EnsureOrganization(ctx context.Context, in OrganizationInput) (*Organization, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
+const (
+	AgentLLM       AgentKind = "llm"
+	AgentEmbedding AgentKind = "embedding"
+)
+
+type Route struct {
+	Name            string
+	Provider        string
+	BaseURL         string
+	Secret          string
+	AllowedModels   []string
+	DefaultModel    string
+	PricingRevision int64
+	Pricing         []ModelPrice
+}
+
+// ModelPrice declares an immutable USD pricing revision for admission and
+// settlement of provider-cost budgets.
+type ModelPrice struct {
+	Model                           Ref
+	InputNanosPerMillionTokens      int64
+	OutputNanosPerMillionTokens     int64
+	CacheReadNanosPerMillionTokens  int64
+	CacheWriteNanosPerMillionTokens int64
+	ReasoningNanosPerMillionTokens  int64
+}
+
+// ProviderRouteStatus is the persisted operational state of a provider route.
+type ProviderRouteStatus string
+
+const ProviderRouteActive ProviderRouteStatus = "active"
+
+// ProviderRouteActivation is bounded evidence that Kave successfully probed
+// the exact route, model, and secret version before enabling provider traffic.
+// It never contains provider credentials or response payloads.
+type ProviderRouteActivation struct {
+	RouteID           string
+	Route             Ref
+	Provider          Ref
+	Model             Ref
+	Status            ProviderRouteStatus
+	RouteRevision     int64
+	SecretVersion     int64
+	ValidatedAt       time.Time
+	ProviderRequestID string
+}
+
+type AgentSpec struct {
+	Name    Agent
+	Kind    AgentKind
+	Route   string
+	Enabled bool
+}
+
+type LimitWindow string
+
+const (
+	WindowAllTime LimitWindow = "all_time"
+	WindowDay     LimitWindow = "day"
+	WindowMonth   LimitWindow = "month"
+)
+
+type LimitSelector struct {
+	Tenant  Ref
+	Actor   Ref
+	BillTo  Ref
+	Agent   Agent
+	Model   Ref
+	Feature Ref
+}
+
+type Limit struct {
+	Key      Ref
+	Metric   Metric
+	Selector LimitSelector
+	Window   LimitWindow
+	HardCap  int64
+	SoftCap  *int64
+	Enabled  bool
+}
+
+type Manifest struct {
+	Namespace Namespace
+	Routes    []Route
+	Agents    []AgentSpec
+	Limits    []Limit
+}
+
+const (
+	maxManifestRoutes = 128
+	maxManifestAgents = 128
+	maxManifestLimits = 512
+	maxRouteModels    = 256
+
+	maxServiceKeyOperations = 8
+	maxServiceKeyAgents     = 64
+)
+
+type Change struct {
+	Kind         ChangeKind
+	ResourceKind string
+	Name         Ref
+	Fields       []string
+}
+
+type ChangeKind string
+
+const (
+	ChangeCreate    ChangeKind = "create"
+	ChangeUpdate    ChangeKind = "update"
+	ChangeDelete    ChangeKind = "delete"
+	ChangeUnchanged ChangeKind = "unchanged"
+)
+
+type ApplyResult struct {
+	NamespaceID string
+	Revision    int64
+	Applied     bool
+	Changes     []Change
+}
+
+type ApplyOption interface{ applyApply(*applyOptions) }
+type applyOption func(*applyOptions)
+
+func (option applyOption) applyApply(options *applyOptions) { option(options) }
+
+type applyOptions struct {
+	dryRun, prune    bool
+	expectedRevision int64
+}
+
+func DryRun() ApplyOption { return applyOption(func(options *applyOptions) { options.dryRun = true }) }
+func Prune() ApplyOption  { return applyOption(func(options *applyOptions) { options.prune = true }) }
+func ExpectRevision(revision int64) ApplyOption {
+	return applyOption(func(options *applyOptions) { options.expectedRevision = revision })
+}
+
+type Operation string
+
+const (
+	OperationConfigApply  Operation = "config.apply"
+	OperationSecretsWrite Operation = "secrets.write"
+	OperationKeysManage   Operation = "keys.manage"
+	OperationLimitsSync   Operation = "limits.sync"
+	OperationUsageRead    Operation = "usage.read"
+	OperationAuditRead    Operation = "audit.read"
+	OperationConsume      Operation = "consume"
+	OperationInvoke       Operation = "invoke"
+)
+
+type ServiceKeySpec struct {
+	Name           Ref
+	Operations     []Operation
+	AllowedAgents  []Agent
+	CanAssertScope bool
+	ExpiresAt      time.Time
+	// RawKey is normally empty, causing the SDK to generate a new credential.
+	// Reuse the returned value only to retry an ambiguous issuance result.
+	RawKey string `json:"-"`
+}
+
+func (spec ServiceKeySpec) String() string {
+	return fmt.Sprintf("{Name:%s Operations:%v AllowedAgents:%v CanAssertScope:%t ExpiresAt:%s RawKey:[REDACTED]}",
+		spec.Name, spec.Operations, spec.AllowedAgents, spec.CanAssertScope, spec.ExpiresAt.UTC().Format(time.RFC3339))
+}
+
+func (spec ServiceKeySpec) GoString() string { return spec.String() }
+
+type IssuedServiceKey struct {
+	ID        string
+	Name      Ref
+	Prefix    string
+	RawKey    string `json:"-"`
+	Created   bool
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+func (key IssuedServiceKey) String() string {
+	return fmt.Sprintf("{ID:%s Name:%s Prefix:%s RawKey:[REDACTED] Created:%t CreatedAt:%s ExpiresAt:%s}",
+		key.ID, key.Name, key.Prefix, key.Created, key.CreatedAt.UTC().Format(time.RFC3339), key.ExpiresAt.UTC().Format(time.RFC3339))
+}
+
+func (key IssuedServiceKey) GoString() string { return key.String() }
+
+type SecretSource string
+
+const (
+	SecretEncrypted SecretSource = "encrypted"
+	SecretExternal  SecretSource = "external"
+)
+
+type SecretMetadata struct {
+	ID        string
+	Name      Ref
+	Source    SecretSource
+	Version   int64
+	Status    string
+	UpdatedAt time.Time
+}
+
+type SyncLimitsResult struct {
+	Revision int64
+	Created  int32
+	Updated  int32
+	Disabled int32
+}
+
+type kernelController interface {
+	Apply(context.Context, *connect.Request[kernelv2.ApplyRequest]) (*connect.Response[kernelv2.ApplyResponse], error)
+	PutSecret(context.Context, *connect.Request[kernelv2.PutSecretRequest]) (*connect.Response[kernelv2.SecretMetadata], error)
+	IssueServiceKey(context.Context, *connect.Request[kernelv2.IssueServiceKeyRequest]) (*connect.Response[kernelv2.IssuedServiceKey], error)
+	RevokeServiceKey(context.Context, *connect.Request[kernelv2.RevokeServiceKeyRequest]) (*connect.Response[emptypb.Empty], error)
+	RevokeSecret(context.Context, *connect.Request[kernelv2.RevokeSecretRequest]) (*connect.Response[emptypb.Empty], error)
+	ActivateProviderRoute(context.Context, *connect.Request[kernelv2.ActivateProviderRouteRequest]) (*connect.Response[kernelv2.ProviderRouteActivation], error)
+	SyncLimits(context.Context, *connect.Request[kernelv2.SyncLimitsRequest]) (*connect.Response[kernelv2.SyncLimitsResponse], error)
+}
+
+func newKernelController(client *Client) kernelController {
+	httpClient := client.baseClient
+	httpClient.Jar = nil
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return ErrRedirectNotAllowed }
+	return kernelv2connect.NewKernelServiceClient(&httpClient, client.endpoint.String())
+}
+
+func (c *Client) Apply(ctx context.Context, manifest Manifest, once Idempotency, options ...ApplyOption) (ApplyResult, error) {
+	if err := c.validateControl(ctx, once); err != nil {
+		return ApplyResult{}, err
 	}
-	orgs, err := c.listAllOrganizations(ctx)
-	if err != nil {
-		return nil, err
+	if err := manifest.Namespace.Validate(); err != nil {
+		return ApplyResult{}, err
 	}
-	for _, org := range orgs {
-		if org.GetSlug() == req.GetSlug() || org.GetName() == req.GetName() {
-			return toOrganization(org), nil
+	settings := applyOptions{}
+	for _, option := range options {
+		if option == nil {
+			return ApplyResult{}, fmt.Errorf("%w: apply option is nil", ErrInvalidArgument)
 		}
+		option.applyApply(&settings)
 	}
-	resp, err := c.control.CreateOrganization(ctx, connect.NewRequest(req))
+	if settings.expectedRevision < 0 {
+		return ApplyResult{}, fmt.Errorf("%w: expected revision must not be negative", ErrInvalidArgument)
+	}
+	protoManifest, err := manifestToProto(manifest)
 	if err != nil {
-		return nil, wrapError(err)
+		return ApplyResult{}, err
 	}
-	return toOrganization(resp.Msg), nil
-}
-
-// EnsureProject returns the project matching the input's slug or name within the
-// org, creating it if absent.
-func (c *Client) EnsureProject(ctx context.Context, in ProjectInput) (*Project, error) {
-	req, err := in.request()
+	req := connect.NewRequest(&kernelv2.ApplyRequest{
+		Manifest: protoManifest, DryRun: settings.dryRun, Prune: settings.prune,
+		ExpectedRevision: settings.expectedRevision, IdempotencyKey: string(once.key),
+	})
+	c.authorize(req)
+	response, err := c.controller.Apply(ctx, req)
 	if err != nil {
-		return nil, err
+		return ApplyResult{}, normalizeError(err)
 	}
-	projects, err := c.listAllProjects(ctx, req.GetOrgId())
-	if err != nil {
-		return nil, err
+	if response == nil || response.Msg == nil || Ref(response.Msg.GetNamespaceId()).Validate() != nil || response.Msg.GetRevision() <= 0 {
+		return ApplyResult{}, ErrInvalidResponse
 	}
-	for _, p := range projects {
-		if p.GetSlug() == req.GetSlug() || p.GetName() == req.GetName() {
-			return toProject(p), nil
+	changes := make([]Change, 0, len(response.Msg.GetChanges()))
+	for _, change := range response.Msg.GetChanges() {
+		if change == nil || validateIdentifier(change.GetResourceKind()) != nil || change.GetName() == "" {
+			return ApplyResult{}, ErrInvalidResponse
 		}
-	}
-	resp, err := c.control.CreateProject(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toProject(resp.Msg), nil
-}
-
-// EnsureEnvironment returns the environment matching the input's slug or name
-// within the project, creating it if absent.
-func (c *Client) EnsureEnvironment(ctx context.Context, in EnvironmentInput) (*Environment, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
-	}
-	envs, err := c.listAllEnvironments(ctx, req.GetProjectId())
-	if err != nil {
-		return nil, err
-	}
-	for _, env := range envs {
-		if env.GetSlug() == req.GetSlug() || env.GetName() == req.GetName() {
-			return toEnvironment(env), nil
+		kind := ChangeKind("")
+		switch change.GetKind() {
+		case kernelv2.ChangeKind_CHANGE_KIND_CREATE:
+			kind = ChangeCreate
+		case kernelv2.ChangeKind_CHANGE_KIND_UPDATE:
+			kind = ChangeUpdate
+		case kernelv2.ChangeKind_CHANGE_KIND_DELETE:
+			kind = ChangeDelete
+		case kernelv2.ChangeKind_CHANGE_KIND_UNCHANGED:
+			kind = ChangeUnchanged
+		default:
+			return ApplyResult{}, ErrInvalidResponse
 		}
-	}
-	resp, err := c.control.CreateEnvironment(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toEnvironment(resp.Msg), nil
-}
-
-// EnsureAgent returns the agent matching the input's name within the
-// environment, creating it if absent.
-func (c *Client) EnsureAgent(ctx context.Context, in AgentInput) (*Agent, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
-	}
-	agents, err := c.listAllAgents(ctx, req.GetEnvId())
-	if err != nil {
-		return nil, err
-	}
-	for _, a := range agents {
-		if a.GetName() == req.GetName() {
-			return toAgent(a), nil
+		if err := Ref(change.GetName()).Validate(); err != nil {
+			return ApplyResult{}, ErrInvalidResponse
 		}
-	}
-	resp, err := c.control.CreateAgent(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toAgent(resp.Msg), nil
-}
-
-// EnsurePolicy returns the policy matching the input's name within the
-// environment, creating it if absent.
-func (c *Client) EnsurePolicy(ctx context.Context, in PolicyInput) (*Policy, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
-	}
-	policies, err := c.listAllPolicies(ctx, req.GetEnvId())
-	if err != nil {
-		return nil, err
-	}
-	for _, p := range policies {
-		if p.GetName() == req.GetName() {
-			return toPolicy(p), nil
-		}
-	}
-	resp, err := c.control.CreatePolicy(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toPolicy(resp.Msg), nil
-}
-
-// EnsureBudget creates or replaces an agent budget.
-func (c *Client) EnsureBudget(ctx context.Context, in BudgetInput) (*Budget, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
-	}
-	current, err := c.control.GetBudget(ctx, connect.NewRequest(&controlv1.GetBudgetRequest{AgentId: req.GetAgentId()}))
-	if err == nil {
-		if budgetMatches(current.Msg, req) {
-			return toBudget(current.Msg), nil
-		}
-		if _, derr := c.control.DeleteBudget(ctx, connect.NewRequest(&controlv1.DeleteBudgetRequest{AgentId: req.GetAgentId()})); derr != nil {
-			return nil, wrapError(derr)
-		}
-	} else if !IsNotFound(err) {
-		return nil, wrapError(err)
-	}
-
-	created, err := c.control.CreateBudget(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toBudget(created.Msg), nil
-}
-
-func budgetMatches(existing *controlv1.Budget, desired *controlv1.CreateBudgetRequest) bool {
-	if existing == nil || desired == nil {
-		return false
-	}
-	if existing.GetPeriod() != desired.GetPeriod() {
-		return false
-	}
-	if !amountsEqual(existing.GetHardCap(), desired.GetHardCap()) {
-		return false
-	}
-	return amountsEqual(existing.GetSoftCap(), desired.GetSoftCap())
-}
-
-// EnsureCredential returns the credential matching connector_type + label within
-// the env, creating it if absent.
-func (c *Client) EnsureCredential(ctx context.Context, in CredentialInput) (*Credential, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.control.ListCredentials(ctx, connect.NewRequest(&controlv1.ListCredentialsRequest{
-		Filter: &controlv1.CredentialFilter{
-			EnvId:         req.GetEnvId(),
-			ConnectorType: req.GetConnectorType(),
-			Label:         req.GetLabel(),
-		},
-		Limit: 1,
-	}))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	if creds := resp.Msg.GetCredentials(); len(creds) > 0 {
-		return toCredential(creds[0]), nil
-	}
-	created, err := c.control.CreateCredential(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toCredential(created.Msg), nil
-}
-
-// CreateAgentToken issues a new agent token. The returned RawToken is shown only once.
-func (c *Client) CreateAgentToken(ctx context.Context, in TokenInput) (*IssuedToken, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.control.CreateToken(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toIssuedToken(resp.Msg), nil
-}
-
-// EnsureRole returns the role matching the input's name, creating it if absent.
-func (c *Client) EnsureRole(ctx context.Context, in RoleInput) (*Role, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.rbac.ListRoles(ctx, connect.NewRequest(&emptypb.Empty{}))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	for _, role := range resp.Msg.GetRoles() {
-		if role.GetName() == req.GetName() {
-			return toRole(role), nil
-		}
-	}
-	created, err := c.rbac.CreateRole(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toRole(created.Msg), nil
-}
-
-// EnsureBinding returns the binding matching role + subject + scope, creating it
-// if absent.
-func (c *Client) EnsureBinding(ctx context.Context, in BindingInput) (*Binding, error) {
-	req, err := in.request()
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.rbac.ListBindings(ctx, connect.NewRequest(&emptypb.Empty{}))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	for _, binding := range resp.Msg.GetBindings() {
-		if binding.GetRoleId() == req.GetRoleId() &&
-			binding.GetSubject() == req.GetSubject() &&
-			binding.GetScope() == req.GetScope() {
-			return toBinding(binding), nil
-		}
-	}
-	created, err := c.rbac.CreateBinding(ctx, connect.NewRequest(req))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return toBinding(created.Msg), nil
-}
-
-// ListRoles returns all RBAC roles.
-func (c *Client) ListRoles(ctx context.Context) ([]Role, error) {
-	resp, err := c.rbac.ListRoles(ctx, connect.NewRequest(&emptypb.Empty{}))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	out := make([]Role, 0, len(resp.Msg.GetRoles()))
-	for _, r := range resp.Msg.GetRoles() {
-		out = append(out, *toRole(r))
-	}
-	return out, nil
-}
-
-// ListBindings returns all RBAC bindings.
-func (c *Client) ListBindings(ctx context.Context) ([]Binding, error) {
-	resp, err := c.rbac.ListBindings(ctx, connect.NewRequest(&emptypb.Empty{}))
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	out := make([]Binding, 0, len(resp.Msg.GetBindings()))
-	for _, b := range resp.Msg.GetBindings() {
-		out = append(out, *toBinding(b))
-	}
-	return out, nil
-}
-
-// --- iterators ---
-
-// IterateOrganizations yields every organization, paging transparently.
-func (c *Client) IterateOrganizations(ctx context.Context) iter.Seq2[*Organization, error] {
-	return func(yield func(*Organization, error) bool) {
-		var cursor string
-		for {
-			resp, err := c.control.ListOrganizations(ctx, connect.NewRequest(&controlv1.ListOrganizationsRequest{
-				Limit: defaultPageSize, Cursor: cursor,
-			}))
-			if err != nil {
-				yield(nil, wrapError(err))
-				return
-			}
-			for _, item := range resp.Msg.GetOrganizations() {
-				if !yield(toOrganization(item), nil) {
-					return
-				}
-			}
-			if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-				return
+		fields := slices.Clone(change.GetFields())
+		for _, field := range fields {
+			if validateIdentifier(field) != nil {
+				return ApplyResult{}, ErrInvalidResponse
 			}
 		}
+		changes = append(changes, Change{Kind: kind, ResourceKind: change.GetResourceKind(), Name: Ref(change.GetName()), Fields: fields})
 	}
+	return ApplyResult{NamespaceID: response.Msg.GetNamespaceId(), Revision: response.Msg.GetRevision(), Applied: response.Msg.GetApplied(), Changes: changes}, nil
 }
 
-// IterateProjects yields every project in an organization.
-func (c *Client) IterateProjects(ctx context.Context, orgID string) iter.Seq2[*Project, error] {
-	return func(yield func(*Project, error) bool) {
-		var cursor string
-		for {
-			resp, err := c.control.ListProjects(ctx, connect.NewRequest(&controlv1.ListProjectsRequest{
-				OrgId: orgID, Limit: defaultPageSize, Cursor: cursor,
-			}))
-			if err != nil {
-				yield(nil, wrapError(err))
-				return
-			}
-			for _, item := range resp.Msg.GetProjects() {
-				if !yield(toProject(item), nil) {
-					return
-				}
-			}
-			if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-				return
-			}
+func (c *Client) PutEncryptedSecret(ctx context.Context, namespaceID string, name Ref, plaintext []byte, once Idempotency) (SecretMetadata, error) {
+	if err := c.validateSecretInput(ctx, namespaceID, name, once); err != nil {
+		return SecretMetadata{}, err
+	}
+	if len(plaintext) == 0 {
+		return SecretMetadata{}, fmt.Errorf("%w: secret plaintext is required", ErrInvalidArgument)
+	}
+	if len(plaintext) > 64<<10 {
+		return SecretMetadata{}, fmt.Errorf("%w: secret plaintext must be at most 65536 bytes", ErrInvalidArgument)
+	}
+	copyOfSecret := slices.Clone(plaintext)
+	defer clear(copyOfSecret)
+	req := connect.NewRequest(&kernelv2.PutSecretRequest{
+		NamespaceId: namespaceID, Name: string(name), IdempotencyKey: string(once.key),
+		Value: &kernelv2.PutSecretRequest_Plaintext{Plaintext: copyOfSecret},
+	})
+	c.authorize(req)
+	response, err := c.controller.PutSecret(ctx, req)
+	req.Msg.Value = nil
+	if err != nil {
+		return SecretMetadata{}, normalizeError(err)
+	}
+	return secretMetadataFromProto(response, name, SecretEncrypted)
+}
+
+func (c *Client) PutExternalSecret(ctx context.Context, namespaceID string, name Ref, uri string, once Idempotency) (SecretMetadata, error) {
+	if err := c.validateSecretInput(ctx, namespaceID, name, once); err != nil {
+		return SecretMetadata{}, err
+	}
+	if err := validateExternalSecretURI(uri); err != nil {
+		return SecretMetadata{}, err
+	}
+	req := connect.NewRequest(&kernelv2.PutSecretRequest{
+		NamespaceId: namespaceID, Name: string(name), IdempotencyKey: string(once.key),
+		Value: &kernelv2.PutSecretRequest_ExternalUri{ExternalUri: uri},
+	})
+	c.authorize(req)
+	response, err := c.controller.PutSecret(ctx, req)
+	if err != nil {
+		return SecretMetadata{}, normalizeError(err)
+	}
+	return secretMetadataFromProto(response, name, SecretExternal)
+}
+
+func (c *Client) IssueServiceKey(ctx context.Context, namespaceID string, spec ServiceKeySpec, once Idempotency) (IssuedServiceKey, error) {
+	if err := c.validateControl(ctx, once); err != nil {
+		return IssuedServiceKey{}, err
+	}
+	if err := Ref(namespaceID).Validate(); err != nil {
+		return IssuedServiceKey{}, fmt.Errorf("%w: namespace ID is invalid", ErrInvalidArgument)
+	}
+	if err := validateIdentifier(string(spec.Name)); err != nil {
+		return IssuedServiceKey{}, fmt.Errorf("%w: service-key name is invalid", ErrInvalidArgument)
+	}
+	operations, agents, err := serviceKeySpecToWire(spec)
+	if err != nil {
+		return IssuedServiceKey{}, err
+	}
+	if !spec.ExpiresAt.IsZero() {
+		if spec.ExpiresAt.UTC().UnixMilli() <= 0 || (spec.RawKey == "" && !spec.ExpiresAt.After(time.Now())) {
+			return IssuedServiceKey{}, fmt.Errorf("%w: service-key expiration must be in the future", ErrInvalidArgument)
 		}
 	}
+	material, err := generateServiceKeyMaterial()
+	if spec.RawKey != "" {
+		material, err = parseServiceKeyMaterial(spec.RawKey)
+	}
+	if err != nil {
+		return IssuedServiceKey{}, err
+	}
+	pending := IssuedServiceKey{Name: spec.Name, Prefix: rawServiceKeyPrefix + material.lookupPrefix, RawKey: material.rawKey}
+	var expiresAtMS int64
+	if !spec.ExpiresAt.IsZero() {
+		expiresAtMS = spec.ExpiresAt.UTC().UnixMilli()
+	}
+	req := connect.NewRequest(&kernelv2.IssueServiceKeyRequest{
+		NamespaceId: namespaceID, Name: string(spec.Name), Operations: operations,
+		AllowedAgents: agents, CanAssertScope: spec.CanAssertScope, ExpiresAtMs: expiresAtMS,
+		IdempotencyKey: string(once.key),
+		LookupPrefix:   material.lookupPrefix, SecretHash: append([]byte(nil), material.secretHash[:]...),
+	})
+	c.authorize(req)
+	response, err := c.controller.IssueServiceKey(ctx, req)
+	if err != nil {
+		return pending, normalizeError(err)
+	}
+	if response == nil || response.Msg == nil || Ref(response.Msg.GetId()).Validate() != nil {
+		return pending, ErrInvalidResponse
+	}
+	if response.Msg.GetPrefix() != pending.Prefix || Ref(response.Msg.GetName()) != spec.Name {
+		return pending, ErrInvalidResponse
+	}
+	if response.Msg.GetCreatedAtMs() <= 0 || response.Msg.GetExpiresAtMs() < 0 ||
+		(expiresAtMS == 0 && response.Msg.GetExpiresAtMs() != 0) ||
+		(expiresAtMS != 0 && response.Msg.GetExpiresAtMs() != expiresAtMS) ||
+		(response.Msg.GetExpiresAtMs() != 0 && response.Msg.GetCreatedAtMs() >= response.Msg.GetExpiresAtMs()) {
+		return pending, ErrInvalidResponse
+	}
+	return IssuedServiceKey{
+		ID: response.Msg.GetId(), Name: Ref(response.Msg.GetName()), Prefix: response.Msg.GetPrefix(), RawKey: pending.RawKey,
+		Created: response.Msg.GetCreated(), CreatedAt: unixMilli(response.Msg.GetCreatedAtMs()), ExpiresAt: unixMilli(response.Msg.GetExpiresAtMs()),
+	}, nil
 }
 
-// IterateEnvironments yields every environment in a project.
-func (c *Client) IterateEnvironments(ctx context.Context, projectID string) iter.Seq2[*Environment, error] {
-	return func(yield func(*Environment, error) bool) {
-		var cursor string
-		for {
-			resp, err := c.control.ListEnvironments(ctx, connect.NewRequest(&controlv1.ListEnvironmentsRequest{
-				ProjectId: projectID, Limit: defaultPageSize, Cursor: cursor,
-			}))
-			if err != nil {
-				yield(nil, wrapError(err))
-				return
-			}
-			for _, item := range resp.Msg.GetEnvironments() {
-				if !yield(toEnvironment(item), nil) {
-					return
-				}
-			}
-			if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-				return
-			}
+func serviceKeySpecToWire(spec ServiceKeySpec) ([]string, []string, error) {
+	if len(spec.Operations) == 0 || len(spec.Operations) > maxServiceKeyOperations {
+		return nil, nil, fmt.Errorf("%w: service-key operations must contain between 1 and %d entries", ErrInvalidArgument, maxServiceKeyOperations)
+	}
+	operations := make([]string, len(spec.Operations))
+	seenOperations := make(map[Operation]struct{}, len(spec.Operations))
+	requiresAgentAllowlist := false
+	for i, operation := range spec.Operations {
+		switch operation {
+		case OperationConfigApply, OperationSecretsWrite, OperationKeysManage,
+			OperationLimitsSync, OperationUsageRead, OperationAuditRead,
+			OperationConsume, OperationInvoke:
+		default:
+			return nil, nil, fmt.Errorf("%w: unsupported service-key operation %q", ErrInvalidArgument, operation)
+		}
+		if _, exists := seenOperations[operation]; exists {
+			return nil, nil, fmt.Errorf("%w: duplicate service-key operation %q", ErrInvalidArgument, operation)
+		}
+		seenOperations[operation] = struct{}{}
+		if operation == OperationConsume || operation == OperationInvoke {
+			requiresAgentAllowlist = true
+		}
+		operations[i] = string(operation)
+	}
+
+	if len(spec.AllowedAgents) > maxServiceKeyAgents {
+		return nil, nil, fmt.Errorf("%w: service-key allowed agents must contain at most %d entries", ErrInvalidArgument, maxServiceKeyAgents)
+	}
+	agents := make([]string, len(spec.AllowedAgents))
+	seenAgents := make(map[Agent]struct{}, len(spec.AllowedAgents))
+	for i, agent := range spec.AllowedAgents {
+		if err := agent.Validate(); err != nil {
+			return nil, nil, fmt.Errorf("%w: service-key allowed agent %q is invalid", ErrInvalidArgument, agent)
+		}
+		if _, exists := seenAgents[agent]; exists {
+			return nil, nil, fmt.Errorf("%w: duplicate service-key allowed agent %q", ErrInvalidArgument, agent)
+		}
+		seenAgents[agent] = struct{}{}
+		agents[i] = string(agent)
+	}
+	if requiresAgentAllowlist && len(agents) == 0 {
+		return nil, nil, fmt.Errorf("%w: consume and invoke service keys require an explicit agent allowlist", ErrInvalidArgument)
+	}
+	return operations, agents, nil
+}
+
+// RevokeServiceKey idempotently revokes a namespace-bound machine credential.
+func (c *Client) RevokeServiceKey(ctx context.Context, id Ref, reason string) error {
+	if err := c.validateControlRequest(ctx); err != nil {
+		return err
+	}
+	if err := id.Validate(); err != nil {
+		return fmt.Errorf("%w: service-key ID is invalid", ErrInvalidArgument)
+	}
+	if err := validateRevokeReason(reason); err != nil {
+		return err
+	}
+	req := connect.NewRequest(&kernelv2.RevokeServiceKeyRequest{Id: string(id), Reason: reason})
+	c.authorize(req)
+	response, err := c.controller.RevokeServiceKey(ctx, req)
+	if err != nil {
+		return normalizeError(err)
+	}
+	if response == nil || response.Msg == nil {
+		return ErrInvalidResponse
+	}
+	return nil
+}
+
+// RevokeSecret idempotently revokes a secret in the service key's namespace.
+func (c *Client) RevokeSecret(ctx context.Context, id Ref, reason string) error {
+	if err := c.validateControlRequest(ctx); err != nil {
+		return err
+	}
+	if err := id.Validate(); err != nil {
+		return fmt.Errorf("%w: secret ID is invalid", ErrInvalidArgument)
+	}
+	if err := validateRevokeReason(reason); err != nil {
+		return err
+	}
+	req := connect.NewRequest(&kernelv2.RevokeSecretRequest{Id: string(id), Reason: reason})
+	c.authorize(req)
+	response, err := c.controller.RevokeSecret(ctx, req)
+	if err != nil {
+		return normalizeError(err)
+	}
+	if response == nil || response.Msg == nil {
+		return ErrInvalidResponse
+	}
+	return nil
+}
+
+// ActivateProviderRoute performs a payload-free live credential and model
+// probe. An empty model asks Kave to probe the route's declared default model.
+// Provider traffic remains disabled until this call succeeds for the current
+// route and secret revisions.
+func (c *Client) ActivateProviderRoute(ctx context.Context, namespaceID string, route Ref, model Ref) (ProviderRouteActivation, error) {
+	if err := c.validateControlRequest(ctx); err != nil {
+		return ProviderRouteActivation{}, err
+	}
+	if err := Ref(namespaceID).Validate(); err != nil {
+		return ProviderRouteActivation{}, fmt.Errorf("%w: namespace ID is invalid", ErrInvalidArgument)
+	}
+	if err := validateIdentifier(string(route)); err != nil {
+		return ProviderRouteActivation{}, fmt.Errorf("%w: provider route is invalid", ErrInvalidArgument)
+	}
+	if model != "" {
+		if err := model.Validate(); err != nil {
+			return ProviderRouteActivation{}, fmt.Errorf("%w: provider model is invalid", ErrInvalidArgument)
 		}
 	}
-}
 
-// IterateAgents yields every agent in an environment.
-func (c *Client) IterateAgents(ctx context.Context, envID string) iter.Seq2[*Agent, error] {
-	return func(yield func(*Agent, error) bool) {
-		var cursor string
-		for {
-			resp, err := c.control.ListAgents(ctx, connect.NewRequest(&controlv1.ListAgentsRequest{
-				EnvId: envID, Limit: defaultPageSize, Cursor: cursor,
-			}))
-			if err != nil {
-				yield(nil, wrapError(err))
-				return
-			}
-			for _, item := range resp.Msg.GetAgents() {
-				if !yield(toAgent(item), nil) {
-					return
-				}
-			}
-			if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-				return
-			}
-		}
+	req := connect.NewRequest(&kernelv2.ActivateProviderRouteRequest{
+		NamespaceId: namespaceID,
+		Route:       string(route),
+		Model:       string(model),
+	})
+	c.authorize(req)
+	response, err := c.controller.ActivateProviderRoute(ctx, req)
+	if err != nil {
+		return ProviderRouteActivation{}, normalizeError(err)
 	}
-}
-
-// IteratePolicies yields every policy in an environment.
-func (c *Client) IteratePolicies(ctx context.Context, envID string) iter.Seq2[*Policy, error] {
-	return func(yield func(*Policy, error) bool) {
-		var cursor string
-		for {
-			resp, err := c.control.ListPolicies(ctx, connect.NewRequest(&controlv1.ListPoliciesRequest{
-				EnvId: envID, Limit: defaultPageSize, Cursor: cursor,
-			}))
-			if err != nil {
-				yield(nil, wrapError(err))
-				return
-			}
-			for _, item := range resp.Msg.GetPolicies() {
-				if !yield(toPolicy(item), nil) {
-					return
-				}
-			}
-			if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-				return
-			}
-		}
+	if response == nil || response.Msg == nil {
+		return ProviderRouteActivation{}, ErrInvalidResponse
 	}
+	msg := response.Msg
+	if err := Ref(msg.GetRouteId()).Validate(); err != nil ||
+		Ref(msg.GetRoute()) != route || validateIdentifier(msg.GetRoute()) != nil ||
+		Ref(msg.GetProvider()).Validate() != nil || Ref(msg.GetModel()).Validate() != nil ||
+		ProviderRouteStatus(msg.GetStatus()) != ProviderRouteActive ||
+		msg.GetRouteRevision() <= 0 || msg.GetSecretVersion() <= 0 || msg.GetValidatedAtMs() <= 0 ||
+		(model != "" && Ref(msg.GetModel()) != model) ||
+		len(msg.GetProviderRequestId()) > 255 || strings.ContainsAny(msg.GetProviderRequestId(), "\r\n") {
+		return ProviderRouteActivation{}, ErrInvalidResponse
+	}
+
+	return ProviderRouteActivation{
+		RouteID:           msg.GetRouteId(),
+		Route:             Ref(msg.GetRoute()),
+		Provider:          Ref(msg.GetProvider()),
+		Model:             Ref(msg.GetModel()),
+		Status:            ProviderRouteStatus(msg.GetStatus()),
+		RouteRevision:     msg.GetRouteRevision(),
+		SecretVersion:     msg.GetSecretVersion(),
+		ValidatedAt:       unixMilli(msg.GetValidatedAtMs()),
+		ProviderRequestID: msg.GetProviderRequestId(),
+	}, nil
 }
 
-// --- internal proto-level list helpers (used by Ensure* and Bootstrap) ---
-
-func (c *Client) listAllOrganizations(ctx context.Context) ([]*controlv1.Organization, error) {
-	var (
-		cursor string
-		out    []*controlv1.Organization
-	)
-	for {
-		resp, err := c.control.ListOrganizations(ctx, connect.NewRequest(&controlv1.ListOrganizationsRequest{
-			Limit: defaultPageSize, Cursor: cursor,
-		}))
+func (c *Client) SyncLimits(ctx context.Context, namespaceID string, owner Ref, revision int64, limits []Limit, once Idempotency) (SyncLimitsResult, error) {
+	if err := c.validateControl(ctx, once); err != nil {
+		return SyncLimitsResult{}, err
+	}
+	if err := Ref(namespaceID).Validate(); err != nil {
+		return SyncLimitsResult{}, fmt.Errorf("%w: namespace ID is invalid", ErrInvalidArgument)
+	}
+	if err := owner.Validate(); err != nil {
+		return SyncLimitsResult{}, fmt.Errorf("%w: limit owner is invalid", ErrInvalidArgument)
+	}
+	if owner == "operator" {
+		return SyncLimitsResult{}, fmt.Errorf("%w: limit owner %q is reserved", ErrInvalidArgument, owner)
+	}
+	if revision <= 0 {
+		return SyncLimitsResult{}, fmt.Errorf("%w: source revision must be positive", ErrInvalidArgument)
+	}
+	if len(limits) > maxManifestLimits {
+		return SyncLimitsResult{}, fmt.Errorf("%w: at most %d limits may be synchronized", ErrInvalidArgument, maxManifestLimits)
+	}
+	protoLimits := make([]*kernelv2.LimitSpec, 0, len(limits))
+	seenLimits := make(map[Ref]struct{}, len(limits))
+	for _, limit := range limits {
+		value, err := limitToProto(limit)
 		if err != nil {
-			return nil, wrapError(err)
+			return SyncLimitsResult{}, err
 		}
-		out = append(out, resp.Msg.GetOrganizations()...)
-		if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-			return out, nil
+		if _, exists := seenLimits[limit.Key]; exists {
+			return SyncLimitsResult{}, fmt.Errorf("%w: duplicate limit key %q", ErrInvalidArgument, limit.Key)
 		}
+		seenLimits[limit.Key] = struct{}{}
+		protoLimits = append(protoLimits, value)
+	}
+	req := connect.NewRequest(&kernelv2.SyncLimitsRequest{
+		NamespaceId: namespaceID, Owner: string(owner), Revision: revision, Limits: protoLimits, IdempotencyKey: string(once.key),
+	})
+	c.authorize(req)
+	response, err := c.controller.SyncLimits(ctx, req)
+	if err != nil {
+		return SyncLimitsResult{}, normalizeError(err)
+	}
+	if response == nil || response.Msg == nil {
+		return SyncLimitsResult{}, ErrInvalidResponse
+	}
+	if response.Msg.GetRevision() != revision || response.Msg.GetCreated() < 0 || response.Msg.GetUpdated() < 0 || response.Msg.GetDisabled() < 0 {
+		return SyncLimitsResult{}, ErrInvalidResponse
+	}
+	return SyncLimitsResult{Revision: response.Msg.GetRevision(), Created: response.Msg.GetCreated(), Updated: response.Msg.GetUpdated(), Disabled: response.Msg.GetDisabled()}, nil
+}
+
+func (c *Client) validateControl(ctx context.Context, once Idempotency) error {
+	if err := c.validateControlRequest(ctx); err != nil {
+		return err
+	}
+	if err := once.key.Validate(); err != nil {
+		return fmt.Errorf("%w: idempotency key is invalid", ErrInvalidArgument)
+	}
+	return nil
+}
+
+func (c *Client) validateControlRequest(ctx context.Context) error {
+	if c == nil || c.controller == nil {
+		return fmt.Errorf("%w: client is not configured", ErrInvalidConfig)
+	}
+	if ctx == nil {
+		return fmt.Errorf("%w: context is nil", ErrInvalidArgument)
+	}
+	return nil
+}
+
+func validateRevokeReason(reason string) error {
+	if len(reason) > 256 || strings.ContainsAny(reason, "\r\n") {
+		return fmt.Errorf("%w: revoke reason must be at most 256 bytes on one line", ErrInvalidArgument)
+	}
+	return nil
+}
+
+func validateExternalSecretURI(raw string) error {
+	if len(raw) > 2048 || strings.TrimSpace(raw) != raw || strings.ContainsAny(raw, "\r\n") {
+		return fmt.Errorf("%w: external secret URI is invalid", ErrInvalidArgument)
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.User != nil || (u.Host == "" && u.Opaque == "" && u.Path == "") {
+		return fmt.Errorf("%w: external secret URI must be absolute and contain no user info", ErrInvalidArgument)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "vault", "aws-secretsmanager", "gcp-secretmanager", "azure-keyvault":
+		return nil
+	default:
+		return fmt.Errorf("%w: external secret URI uses an unsupported scheme", ErrInvalidArgument)
 	}
 }
 
-func (c *Client) listAllProjects(ctx context.Context, orgID string) ([]*controlv1.Project, error) {
-	if orgID == "" {
-		return nil, invalidArgument("org_id is required")
+func (c *Client) validateSecretInput(ctx context.Context, namespaceID string, name Ref, once Idempotency) error {
+	if err := c.validateControl(ctx, once); err != nil {
+		return err
 	}
-	var (
-		cursor string
-		out    []*controlv1.Project
-	)
-	for {
-		resp, err := c.control.ListProjects(ctx, connect.NewRequest(&controlv1.ListProjectsRequest{
-			OrgId: orgID, Limit: defaultPageSize, Cursor: cursor,
-		}))
+	if err := Ref(namespaceID).Validate(); err != nil {
+		return fmt.Errorf("%w: namespace ID is invalid", ErrInvalidArgument)
+	}
+	if err := validateIdentifier(string(name)); err != nil {
+		return fmt.Errorf("%w: secret name is invalid", ErrInvalidArgument)
+	}
+	return nil
+}
+
+type headerRequest interface{ Header() http.Header }
+
+func (c *Client) authorize(request headerRequest) {
+	request.Header().Set("Authorization", "Bearer "+c.serviceKey)
+}
+
+func manifestToProto(manifest Manifest) (*kernelv2.Manifest, error) {
+	if len(manifest.Routes) > maxManifestRoutes {
+		return nil, fmt.Errorf("%w: at most %d routes may be applied", ErrInvalidArgument, maxManifestRoutes)
+	}
+	if len(manifest.Agents) > maxManifestAgents {
+		return nil, fmt.Errorf("%w: at most %d agents may be applied", ErrInvalidArgument, maxManifestAgents)
+	}
+	if len(manifest.Limits) > maxManifestLimits {
+		return nil, fmt.Errorf("%w: at most %d limits may be applied", ErrInvalidArgument, maxManifestLimits)
+	}
+
+	routes := make([]*kernelv2.RouteSpec, 0, len(manifest.Routes))
+	seenRoutes := make(map[string]struct{}, len(manifest.Routes))
+	for _, route := range manifest.Routes {
+		prices, err := routeToProtoPrices(route)
 		if err != nil {
-			return nil, wrapError(err)
+			return nil, err
 		}
-		out = append(out, resp.Msg.GetProjects()...)
-		if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-			return out, nil
+		if _, exists := seenRoutes[route.Name]; exists {
+			return nil, fmt.Errorf("%w: duplicate route name %q", ErrInvalidArgument, route.Name)
 		}
+		seenRoutes[route.Name] = struct{}{}
+		routes = append(routes, &kernelv2.RouteSpec{Name: route.Name, Provider: route.Provider, BaseUrl: route.BaseURL, Secret: route.Secret, AllowedModels: slices.Clone(route.AllowedModels), DefaultModel: route.DefaultModel, PricingRevision: route.PricingRevision, Pricing: prices})
 	}
-}
-
-func (c *Client) listAllEnvironments(ctx context.Context, projectID string) ([]*controlv1.Environment, error) {
-	if projectID == "" {
-		return nil, invalidArgument("project_id is required")
+	agents := make([]*kernelv2.AgentSpec, 0, len(manifest.Agents))
+	seenAgents := make(map[Agent]struct{}, len(manifest.Agents))
+	for _, agent := range manifest.Agents {
+		if err := agent.Name.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: agent name is invalid", ErrInvalidArgument)
+		}
+		if err := validateIdentifier(agent.Route); err != nil {
+			return nil, fmt.Errorf("%w: agent route %v", ErrInvalidArgument, err)
+		}
+		if _, exists := seenAgents[agent.Name]; exists {
+			return nil, fmt.Errorf("%w: duplicate agent name %q", ErrInvalidArgument, agent.Name)
+		}
+		if _, exists := seenRoutes[agent.Route]; !exists {
+			return nil, fmt.Errorf("%w: agent %q references unknown route %q", ErrInvalidArgument, agent.Name, agent.Route)
+		}
+		kind := kernelv2.AgentKind_AGENT_KIND_UNSPECIFIED
+		switch agent.Kind {
+		case AgentLLM:
+			kind = kernelv2.AgentKind_AGENT_KIND_LLM
+		case AgentEmbedding:
+			kind = kernelv2.AgentKind_AGENT_KIND_EMBEDDING
+		default:
+			return nil, fmt.Errorf("%w: unsupported agent kind", ErrInvalidArgument)
+		}
+		seenAgents[agent.Name] = struct{}{}
+		agents = append(agents, &kernelv2.AgentSpec{Name: string(agent.Name), Kind: kind, Route: agent.Route, Enabled: agent.Enabled})
 	}
-	var (
-		cursor string
-		out    []*controlv1.Environment
-	)
-	for {
-		resp, err := c.control.ListEnvironments(ctx, connect.NewRequest(&controlv1.ListEnvironmentsRequest{
-			ProjectId: projectID, Limit: defaultPageSize, Cursor: cursor,
-		}))
+	limits := make([]*kernelv2.LimitSpec, 0, len(manifest.Limits))
+	seenLimits := make(map[Ref]struct{}, len(manifest.Limits))
+	for _, limit := range manifest.Limits {
+		value, err := limitToProto(limit)
 		if err != nil {
-			return nil, wrapError(err)
+			return nil, err
 		}
-		out = append(out, resp.Msg.GetEnvironments()...)
-		if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-			return out, nil
+		if _, exists := seenLimits[limit.Key]; exists {
+			return nil, fmt.Errorf("%w: duplicate limit key %q", ErrInvalidArgument, limit.Key)
 		}
+		if limit.Selector.Agent != "" {
+			if _, exists := seenAgents[limit.Selector.Agent]; !exists {
+				return nil, fmt.Errorf("%w: limit %q references unknown agent %q", ErrInvalidArgument, limit.Key, limit.Selector.Agent)
+			}
+		}
+		seenLimits[limit.Key] = struct{}{}
+		limits = append(limits, value)
 	}
+	return &kernelv2.Manifest{Namespace: &kernelv2.NamespaceSpec{Account: manifest.Namespace.Account, Application: manifest.Namespace.Application, Environment: manifest.Namespace.Environment}, Routes: routes, Agents: agents, Limits: limits}, nil
 }
 
-func (c *Client) listAllAgents(ctx context.Context, envID string) ([]*controlv1.Agent, error) {
-	if envID == "" {
-		return nil, invalidArgument("env_id is required")
+func routeToProtoPrices(route Route) ([]*kernelv2.ModelPrice, error) {
+	if err := validateIdentifier(route.Name); err != nil {
+		return nil, fmt.Errorf("%w: route name %v", ErrInvalidArgument, err)
 	}
-	var (
-		cursor string
-		out    []*controlv1.Agent
-	)
-	for {
-		resp, err := c.control.ListAgents(ctx, connect.NewRequest(&controlv1.ListAgentsRequest{
-			EnvId: envID, Limit: defaultPageSize, Cursor: cursor,
-		}))
-		if err != nil {
-			return nil, wrapError(err)
+	if err := validateIdentifier(route.Provider); err != nil {
+		return nil, fmt.Errorf("%w: route provider %v", ErrInvalidArgument, err)
+	}
+	if err := validateIdentifier(route.Secret); err != nil {
+		return nil, fmt.Errorf("%w: route secret %v", ErrInvalidArgument, err)
+	}
+	if err := validateProviderBaseURL(route.Provider, route.BaseURL); err != nil {
+		return nil, err
+	}
+	if len(route.AllowedModels) == 0 || len(route.AllowedModels) > maxRouteModels {
+		return nil, fmt.Errorf("%w: route allowed models must contain between 1 and %d entries", ErrInvalidArgument, maxRouteModels)
+	}
+	if len(route.Pricing) > maxRouteModels {
+		return nil, fmt.Errorf("%w: route pricing may contain at most %d entries", ErrInvalidArgument, maxRouteModels)
+	}
+	if route.PricingRevision <= 0 {
+		return nil, fmt.Errorf("%w: route pricing revision must be positive", ErrInvalidArgument)
+	}
+	if err := Ref(route.DefaultModel).Validate(); err != nil {
+		return nil, fmt.Errorf("%w: route default model is invalid", ErrInvalidArgument)
+	}
+
+	allowed := make(map[Ref]struct{}, len(route.AllowedModels))
+	for _, rawModel := range route.AllowedModels {
+		model := Ref(rawModel)
+		if err := model.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: route allowed model %q is invalid", ErrInvalidArgument, rawModel)
 		}
-		out = append(out, resp.Msg.GetAgents()...)
-		if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-			return out, nil
+		if _, exists := allowed[model]; exists {
+			return nil, fmt.Errorf("%w: duplicate route allowed model %q", ErrInvalidArgument, model)
+		}
+		allowed[model] = struct{}{}
+	}
+	if _, exists := allowed[Ref(route.DefaultModel)]; !exists {
+		return nil, fmt.Errorf("%w: route default model must be allowed", ErrInvalidArgument)
+	}
+
+	prices := make([]*kernelv2.ModelPrice, 0, len(route.Pricing))
+	seenPrices := make(map[Ref]struct{}, len(route.Pricing))
+	for _, price := range route.Pricing {
+		if err := price.Model.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: route price model is invalid", ErrInvalidArgument)
+		}
+		if price.InputNanosPerMillionTokens < 0 || price.OutputNanosPerMillionTokens < 0 ||
+			price.CacheReadNanosPerMillionTokens < 0 || price.CacheWriteNanosPerMillionTokens < 0 ||
+			price.ReasoningNanosPerMillionTokens < 0 {
+			return nil, fmt.Errorf("%w: route token prices must not be negative", ErrInvalidArgument)
+		}
+		if _, exists := seenPrices[price.Model]; exists {
+			return nil, fmt.Errorf("%w: duplicate route price model %q", ErrInvalidArgument, price.Model)
+		}
+		if _, exists := allowed[price.Model]; !exists {
+			return nil, fmt.Errorf("%w: priced model %q is not allowed", ErrInvalidArgument, price.Model)
+		}
+		seenPrices[price.Model] = struct{}{}
+		prices = append(prices, &kernelv2.ModelPrice{
+			Model:                           string(price.Model),
+			InputNanosPerMillionTokens:      price.InputNanosPerMillionTokens,
+			OutputNanosPerMillionTokens:     price.OutputNanosPerMillionTokens,
+			CacheReadNanosPerMillionTokens:  price.CacheReadNanosPerMillionTokens,
+			CacheWriteNanosPerMillionTokens: price.CacheWriteNanosPerMillionTokens,
+			ReasoningNanosPerMillionTokens:  price.ReasoningNanosPerMillionTokens,
+		})
+	}
+	for model := range allowed {
+		if _, exists := seenPrices[model]; !exists {
+			return nil, fmt.Errorf("%w: route pricing does not cover allowed model %q", ErrInvalidArgument, model)
 		}
 	}
+	return prices, nil
 }
 
-func (c *Client) listAllPolicies(ctx context.Context, envID string) ([]*controlv1.PolicyRecord, error) {
-	if envID == "" {
-		return nil, invalidArgument("env_id is required")
-	}
-	var (
-		cursor string
-		out    []*controlv1.PolicyRecord
-	)
-	for {
-		resp, err := c.control.ListPolicies(ctx, connect.NewRequest(&controlv1.ListPoliciesRequest{
-			EnvId: envID, Limit: defaultPageSize, Cursor: cursor,
-		}))
-		if err != nil {
-			return nil, wrapError(err)
+func validateProviderBaseURL(provider, raw string) error {
+	if raw == "" {
+		if strings.EqualFold(provider, "openai") {
+			return nil
 		}
-		out = append(out, resp.Msg.GetPolicies()...)
-		if cursor = resp.Msg.GetNextCursor(); cursor == "" {
-			return out, nil
-		}
+		return fmt.Errorf("%w: route base URL is required for provider %q", ErrInvalidArgument, provider)
 	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return fmt.Errorf("%w: route base URL must be absolute HTTP(S) without userinfo, query, fragment, or encoded path", ErrInvalidArgument)
+	}
+	if u.Scheme == "http" && !isLoopbackProviderHost(u.Hostname()) {
+		return fmt.Errorf("%w: plain HTTP provider URLs are allowed only for loopback hosts", ErrInvalidArgument)
+	}
+	return nil
 }
 
-func amountsEqual(a, b *commonv1.Amount) bool {
-	if a == nil || b == nil {
-		return a == b
+func isLoopbackProviderHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
 	}
-	return a.GetCurrency() == b.GetCurrency() && a.GetDecimal() == b.GetDecimal()
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func limitToProto(limit Limit) (*kernelv2.LimitSpec, error) {
+	if err := limit.Key.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: limit key is invalid", ErrInvalidArgument)
+	}
+	if err := limit.Metric.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: limit metric is invalid", ErrInvalidArgument)
+	}
+	for name, value := range map[string]Ref{
+		"tenant": limit.Selector.Tenant, "actor": limit.Selector.Actor, "bill-to": limit.Selector.BillTo,
+		"model": limit.Selector.Model, "feature": limit.Selector.Feature,
+	} {
+		if value != "" {
+			if err := value.Validate(); err != nil {
+				return nil, fmt.Errorf("%w: limit selector %s is invalid", ErrInvalidArgument, name)
+			}
+		}
+	}
+	if limit.Selector.Agent != "" {
+		if err := limit.Selector.Agent.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: limit selector agent is invalid", ErrInvalidArgument)
+		}
+	}
+	if limit.HardCap < 0 || (limit.SoftCap != nil && (*limit.SoftCap < 0 || *limit.SoftCap > limit.HardCap)) {
+		return nil, fmt.Errorf("%w: invalid limit cap", ErrInvalidArgument)
+	}
+	window := kernelv2.LimitWindow_LIMIT_WINDOW_UNSPECIFIED
+	switch limit.Window {
+	case WindowAllTime:
+		window = kernelv2.LimitWindow_LIMIT_WINDOW_ALL_TIME
+	case WindowDay:
+		window = kernelv2.LimitWindow_LIMIT_WINDOW_DAY
+	case WindowMonth:
+		window = kernelv2.LimitWindow_LIMIT_WINDOW_MONTH
+	default:
+		return nil, fmt.Errorf("%w: invalid limit window", ErrInvalidArgument)
+	}
+	return &kernelv2.LimitSpec{Key: string(limit.Key), Metric: string(limit.Metric), Selector: &kernelv2.LimitSelector{Tenant: string(limit.Selector.Tenant), Actor: string(limit.Selector.Actor), BillTo: string(limit.Selector.BillTo), Agent: string(limit.Selector.Agent), Model: string(limit.Selector.Model), Feature: string(limit.Selector.Feature)}, Window: window, HardCap: limit.HardCap, SoftCap: limit.SoftCap, Enabled: limit.Enabled}, nil
+}
+
+func secretMetadataFromProto(response *connect.Response[kernelv2.SecretMetadata], expectedName Ref, expectedSource SecretSource) (SecretMetadata, error) {
+	if response == nil || response.Msg == nil || Ref(response.Msg.GetId()).Validate() != nil ||
+		Ref(response.Msg.GetName()) != expectedName || response.Msg.GetVersion() <= 0 ||
+		response.Msg.GetStatus() != "active" || response.Msg.GetUpdatedAtMs() <= 0 {
+		return SecretMetadata{}, ErrInvalidResponse
+	}
+	source := SecretSource("")
+	switch response.Msg.GetSource() {
+	case kernelv2.SecretSource_SECRET_SOURCE_ENCRYPTED:
+		source = SecretEncrypted
+	case kernelv2.SecretSource_SECRET_SOURCE_EXTERNAL:
+		source = SecretExternal
+	default:
+		return SecretMetadata{}, ErrInvalidResponse
+	}
+	if source != expectedSource {
+		return SecretMetadata{}, ErrInvalidResponse
+	}
+	return SecretMetadata{ID: response.Msg.GetId(), Name: Ref(response.Msg.GetName()), Source: source, Version: response.Msg.GetVersion(), Status: response.Msg.GetStatus(), UpdatedAt: unixMilli(response.Msg.GetUpdatedAtMs())}, nil
+}
+
+func unixMilli(value int64) time.Time {
+	if value <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(value).UTC()
 }

@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	connect "connectrpc.com/connect"
-	kernelv2 "github.com/kave-io/kave/sdk/go/v2/internal/gen"
-	"github.com/kave-io/kave/sdk/go/v2/internal/gen/kernelv2connect"
+	kernelv2 "github.com/kave-io/go-sdk/v2/internal/gen"
+	"github.com/kave-io/go-sdk/v2/internal/gen/kernelv2connect"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -180,5 +180,38 @@ func TestConsumeRejectsUnknownSuccessStatus(t *testing.T) {
 	_, err := client.Consume(WithScope(context.Background(), validScope("status")), Agent("assistant"), Metric("ai_actions"), 1, Once("run/status"))
 	if !errors.Is(err, ErrInvalidResponse) {
 		t.Fatalf("Consume() error = %v, want ErrInvalidResponse", err)
+	}
+}
+
+func TestConsumeRejectsContradictorySuccessDecisions(t *testing.T) {
+	t.Parallel()
+	validViolation := func() *kernelv2.LimitViolation {
+		return &kernelv2.LimitViolation{
+			LimitId: "lim_one", LimitKey: "tenant-cap", Metric: "requests",
+			Used: 10, Requested: 1, HardCap: 10, ResetAtMs: 9999,
+		}
+	}
+	tests := []struct {
+		name     string
+		response *kernelv2.ConsumeResponse
+	}{
+		{name: "missing invocation", response: &kernelv2.ConsumeResponse{Status: kernelv2.DecisionStatus_DECISION_STATUS_ADMITTED}},
+		{name: "admitted with violation", response: &kernelv2.ConsumeResponse{InvocationId: "ivk_one", Status: kernelv2.DecisionStatus_DECISION_STATUS_ADMITTED, Violations: []*kernelv2.LimitViolation{validViolation()}}},
+		{name: "rejected without violation", response: &kernelv2.ConsumeResponse{InvocationId: "ivk_one", Status: kernelv2.DecisionStatus_DECISION_STATUS_REJECTED}},
+		{name: "nil warning", response: &kernelv2.ConsumeResponse{InvocationId: "ivk_one", Status: kernelv2.DecisionStatus_DECISION_STATUS_ADMITTED, Warnings: []*kernelv2.LimitWarning{nil}}},
+		{name: "warning below soft cap", response: &kernelv2.ConsumeResponse{InvocationId: "ivk_one", Status: kernelv2.DecisionStatus_DECISION_STATUS_ADMITTED, Warnings: []*kernelv2.LimitWarning{{LimitId: "lim_one", LimitKey: "tenant-cap", Used: 4, SoftCap: 5, ResetAtMs: 9999}}}},
+		{name: "non violating violation", response: &kernelv2.ConsumeResponse{InvocationId: "ivk_one", Status: kernelv2.DecisionStatus_DECISION_STATUS_REJECTED, Violations: []*kernelv2.LimitViolation{{LimitId: "lim_one", LimitKey: "tenant-cap", Metric: "requests", Used: 4, Requested: 1, HardCap: 10, ResetAtMs: 9999}}}},
+		{name: "nil violation", response: &kernelv2.ConsumeResponse{InvocationId: "ivk_one", Status: kernelv2.DecisionStatus_DECISION_STATUS_REJECTED, Violations: []*kernelv2.LimitViolation{nil}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := openConsumeTestClient(t, func(context.Context, *connect.Request[kernelv2.ConsumeRequest]) (*connect.Response[kernelv2.ConsumeResponse], error) {
+				return connect.NewResponse(test.response), nil
+			})
+			_, err := client.Consume(WithScope(context.Background(), validScope("malformed")), "assistant", MetricRequests, 1, Once("run/malformed"))
+			if !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("Consume() error = %v, want invalid response", err)
+			}
+		})
 	}
 }
